@@ -44,7 +44,394 @@ PCT_GRADES = [
 ]
 
 
-# --- Local API server for measurement data ---
+# ============================================================
+# 算法层：纯函数，无副作用，不访问数据库
+# ============================================================
+
+def meters_to_degrees(meters, avg_lat):
+    """【坐标转换】米→经纬度偏移量
+    实现：经度修正cos(lat)，1°≈111320m(经度方向)/110540m(纬度方向)
+    输入：meters(米), avg_lat(参考纬度)
+    输出：(lng_offset, lat_offset)
+    """
+    lng_offset = meters / 111320.0 / math.cos(avg_lat * math.pi / 180.0)
+    lat_offset = meters / 110540.0
+    return lng_offset, lat_offset
+
+
+def calc_grid_origin(cell_pts, cell_lng, cell_lat, gnbid, ci):
+    """【栅格原点】确定栅格坐标系的随机原点
+    实现：random.seed(gnbid_ci)保证同一小区生成确定性原点，
+         随机选一个采样点作为参考点，偏移半格使参考点位于栅格中央
+    输入：cell_pts[(lng,lat),...], cell_lng, cell_lat, gnbid, ci
+    输出：(origin_lng, origin_lat)
+    """
+    random.seed(f"{gnbid}_{ci}")
+    ref_idx = random.randint(0, len(cell_pts) - 1)
+    origin_lng = cell_pts[ref_idx][0] - cell_lng / 2
+    origin_lat = cell_pts[ref_idx][1] - cell_lat / 2
+    return origin_lng, origin_lat
+
+
+def bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat):
+    """【数学落格】将采样点坐标映射到栅格索引
+    实现：math.floor((coord-origin)/cell_size)
+         用floor不用int：int(-8.9)=-8截断向零错误，floor(-8.9)=-9向负无穷正确
+    输入：lng, lat, origin_lng, origin_lat, cell_lng, cell_lat
+    输出：(gx, gy) 栅格索引
+    """
+    gx = math.floor((lng - origin_lng) / cell_lng)
+    gy = math.floor((lat - origin_lat) / cell_lat)
+    return gx, gy
+
+
+def build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat):
+    """【栅格构建】将小区采样点落格并构建Shapely Polygon列表
+    实现：1.对每个采样点执行数学落格，统计每个格子的cell_count
+         2.对每个非空格子计算sw/ne坐标，构建Shapely Polygon
+    输入：cell_pts[(lng,lat),...], origin_lng, origin_lat, cell_lng, cell_lat
+    输出：[{gx, gy, polygon, cell_count, plmn_count}, ...]
+    """
+    cell_grid = {}
+    for lng, lat in cell_pts:
+        gx, gy = bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat)
+        cell_grid[(gx, gy)] = cell_grid.get((gx, gy), 0) + 1
+
+    polygons = []
+    for (gx, gy), count in cell_grid.items():
+        sw_lng = origin_lng + gx * cell_lng
+        sw_lat = origin_lat + gy * cell_lat
+        ne_lng = origin_lng + (gx + 1) * cell_lng
+        ne_lat = origin_lat + (gy + 1) * cell_lat
+        poly = Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
+        polygons.append({"gx": gx, "gy": gy, "polygon": poly, "cell_count": count, "plmn_count": 0})
+    return polygons
+
+
+def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng, cell_lat):
+    """【PLMN统计】用Shapely covers()判定PLMN采样点落入栅格
+    实现：先数学落格快速定位候选栅格(gx,gy)，再Shapely covers()精确判定
+         两步过滤：数学落格O(1)定位→covers()精确排除边界点
+    输入：plmn_rows[(lng,lat),...], polygons, origin_lng, origin_lat, cell_lng, cell_lat
+    输出：无返回，直接修改polygons[i]["plmn_count"]
+    """
+    poly_map = {(p["gx"], p["gy"]): p for p in polygons}
+    for r in plmn_rows:
+        if r[0] is None or r[1] is None:
+            continue
+        lng, lat = r[0], r[1]
+        pt = Point(lng, lat)
+        gx, gy = bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat)
+        key = (gx, gy)
+        if key in poly_map and poly_map[key]["polygon"].covers(pt):
+            poly_map[key]["plmn_count"] += 1
+
+
+def calc_coverage(cell_count, plmn_count):
+    """【覆盖率计算】cell_count / plmn_count × 100
+    实现：plmn_count=0时返回0，避免除零
+    输入：cell_count(小区采样点数), plmn_count(总采样点数)
+    输出：int 覆盖率百分比
+    """
+    return round(cell_count / plmn_count * 100) if plmn_count > 0 else 0
+
+
+def reconstruct_polygon(origin_lng, origin_lat, cell_lng, cell_lat, gx, gy):
+    """【栅格重建】从grid_params重建Shapely Polygon，避免经纬度精度丢失
+    实现：用origin + gx*cell_size计算sw/ne坐标，与grid_analysis完全相同的算术路径，
+         避免通过URL传递rounded sw/ne导致的浮点精度损失
+    输入：origin_lng, origin_lat, cell_lng, cell_lat, gx, gy
+    输出：Shapely Polygon
+    """
+    origin_lng, origin_lat = float(origin_lng), float(origin_lat)
+    cell_lng, cell_lat = float(cell_lng), float(cell_lat)
+    gx, gy = int(gx), int(gy)
+    sw_lng = origin_lng + gx * cell_lng
+    sw_lat = origin_lat + gy * cell_lat
+    ne_lng = origin_lng + (gx + 1) * cell_lng
+    ne_lat = origin_lat + (gy + 1) * cell_lat
+    return Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
+
+
+def build_where(indoor, freq=None, with_cell=False, with_plmn=False,
+                with_signal=False, with_coords=False, with_bounds=False):
+    """【SQL条件构建】统一构建WHERE子句及参数
+    实现：按开关组合plmn/rsrp/sinr/coord/indoor/earfcn/bounds条件，
+         避免各handler重复拼接SQL字符串
+    输入：indoor(0/1/2), freq(频点), with_cell(加gnbid+ci), with_plmn(加plmn=46000),
+         with_signal(加rsrp/sinr有效), with_coords(加经纬度非空), with_bounds(加空间范围)
+    输出：(where_string, params_list)
+    """
+    conditions = []
+    params = []
+
+    if with_cell:
+        conditions.extend(["gnbid=?", "ci=?"])
+        # 调用方需自行添加gnbid/ci参数到params
+    if with_plmn:
+        conditions.append('plmn="46000"')
+    if with_signal:
+        conditions.extend(['nr_ssb_rsrp!=""', 'nr_ssb_rsrp!="0"', 'nr_ssb_sinr!=""', 'nr_ssb_sinr!="0"'])
+    if with_coords:
+        conditions.append("lng IS NOT NULL")
+    if indoor == "1":
+        conditions.append('in_out_door="In_Door"')
+    elif indoor == "2":
+        conditions.append('in_out_door="Out_Door"')
+    if freq:
+        conditions.append("nr_earfcn=?")
+        params.append(freq)
+    if with_bounds:
+        conditions.extend(["lng>=?", "lng<=?", "lat>=?", "lat<=?"])
+        # bounds参数顺序：(sw_lng, ne_lng, sw_lat, ne_lat)，非shapely.bounds的(minx,miny,maxx,maxy)
+
+    where = " AND ".join(conditions)
+    return where, params
+
+
+def parse_float_rows(rows, *indices):
+    """【数据解析】从DB行中安全提取浮点数
+    实现：跳过空值和转换异常
+    输入：rows(DB行列表), indices(需要解析为float的列索引)
+    输出：解析后的元组列表，异常行跳过
+    """
+    result = []
+    for r in rows:
+        try:
+            vals = tuple(float(r[i]) for i in indices)
+            result.append(vals)
+        except (ValueError, TypeError):
+            pass
+    return result
+
+
+# ============================================================
+# 数据层：数据库访问函数
+# ============================================================
+
+def query_cell_freq(gnbid, ci):
+    """查询5GBaseStation小区频点
+    输入：gnbid, ci
+    输出：str 频点值，不存在则返回空串
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            'SELECT "频点" FROM "5GBaseStation" WHERE "Gnbid"=? AND "Cellid"=? LIMIT 1',
+            [gnbid, ci],
+        ).fetchone()
+        return str(row[0]) if row and row[0] else ""
+    finally:
+        conn.close()
+
+
+def query_cell_points(gnbid, ci, indoor, freq, conn=None):
+    """查询小区采样点(经纬度)
+    输入：gnbid, ci, indoor, freq, conn(可选，外部连接)
+    输出：[(lng, lat), ...] 采样点坐标列表
+    """
+    where, params = build_where(indoor, freq=freq, with_cell=True, with_plmn=True,
+                                with_signal=True, with_coords=True)
+    params = [gnbid, ci] + params
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(f'SELECT lng, lat FROM "data" WHERE {where}', params).fetchall()
+    finally:
+        if own_conn:
+            conn.close()
+    return [(r[0], r[1]) for r in rows if r[0] is not None and r[1] is not None]
+
+
+def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
+    """查询PLMN采样点+统计(总数/RSRP均值)
+    输入：indoor, freq, bounds(sw_lng, ne_lng, sw_lat, ne_lat), conn(可选，外部连接)
+    输出：(plmn_rows, total_count, total_avg_rsrp)
+    优化：用覆盖索引(plmn,nr_earfcn,lng,lat,rsrp)直接取lng/lat/rsrp，Python端统计
+    """
+    where, params = build_where(indoor, freq=freq, with_plmn=True,
+                                with_coords=True, with_bounds=True)
+    params = params + list(bounds)
+
+    own_conn = conn is None
+    if own_conn:
+        conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            f'SELECT lng, lat, rsrp FROM "data" WHERE {where}', params
+        ).fetchall()
+    finally:
+        if own_conn:
+            conn.close()
+
+    plmn_rows = []
+    rsrp_sum = 0.0
+    rsrp_count = 0
+    for r in rows:
+        if r[0] is None or r[1] is None:
+            continue
+        plmn_rows.append((r[0], r[1]))
+        if r[2] is not None:
+            rsrp_sum += r[2]
+            rsrp_count += 1
+    total_count = len(plmn_rows)
+    total_avg = round(rsrp_sum / rsrp_count, 2) if rsrp_count > 0 else None
+    return plmn_rows, total_count, total_avg
+
+
+def query_measurements(gnbid, ci, metric, indoor):
+    """查询散点测量数据(点列表+统计+等级)
+    输入：gnbid, ci, metric(rsrp/sinr), indoor
+    输出：{points, count, avg, grades}
+    """
+    val_col = "rsrp" if metric == "rsrp" else "sinr"
+    where = f'gnbid=? AND ci=? AND lng IS NOT NULL AND {val_col} IS NOT NULL'
+    q_params = [gnbid, ci]
+
+    if indoor == "1":
+        where += ' AND in_out_door="In_Door"'
+    elif indoor == "2":
+        where += ' AND in_out_door="Out_Door"'
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        if metric == "rsrp":
+            stat_row = conn.execute(
+                f'SELECT COUNT(*), AVG({val_col}), '
+                f'SUM(CASE WHEN {val_col}>=-95 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}>=-105 AND {val_col}<-95 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}>=-115 AND {val_col}<-105 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}<-115 THEN 1 ELSE 0 END) '
+                f'FROM "data" WHERE {where}', q_params,
+            ).fetchone()
+        else:
+            stat_row = conn.execute(
+                f'SELECT COUNT(*), AVG({val_col}), '
+                f'SUM(CASE WHEN {val_col}>=15 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}>=5 AND {val_col}<15 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}>=-3 AND {val_col}<5 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN {val_col}<-3 THEN 1 ELSE 0 END) '
+                f'FROM "data" WHERE {where}', q_params,
+            ).fetchone()
+        total_count = stat_row[0] or 0
+        avg_val = round(stat_row[1], 2) if stat_row[1] is not None else None
+        grade_counts = [stat_row[2], stat_row[3], stat_row[4], stat_row[5]]
+
+        rows = conn.execute(
+            f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where} LIMIT 5000',
+            q_params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    idx = 2 if metric == "rsrp" else 3
+    points = []
+    for r in rows:
+        if r[0] is None or r[1] is None or r[idx] is None:
+            continue
+        points.append([r[0], r[1], r[idx]])
+
+    return {"points": points, "count": total_count, "avg": avg_val, "grades": grade_counts}
+
+
+def query_grid_detail_points(poly, indoor, freq):
+    """查询栅格详情采样点，用Shapely covers()过滤，按plmn/gnbid/ci聚合
+    输入：poly(Shapely Polygon), indoor, freq
+    输出：[{nr_earfcn, gnbid, ci, avg_rsrp, avg_sinr, count}, ...]
+    优化：用覆盖索引快速取空间数据，rsrp/sinr用数值列
+    """
+    minx, miny, maxx, maxy = poly.bounds
+    bounds = (minx, maxx, miny, maxy)
+    where, params = build_where(indoor, freq=freq, with_plmn=True,
+                                with_coords=True, with_bounds=True)
+    params = params + list(bounds)
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        rows = conn.execute(
+            f'SELECT lng, lat, plmn, gnbid, ci, nr_earfcn, rsrp, sinr '
+            f'FROM "data" WHERE {where}', params,
+        ).fetchall()
+    finally:
+        conn.close()
+
+    groups = {}
+    for r in rows:
+        if r[0] is None or r[1] is None:
+            continue
+        lng, lat = r[0], r[1]
+        if not poly.covers(Point(lng, lat)):
+            continue
+        if r[6] is None or r[7] is None:
+            continue
+        key = (r[2], r[3], r[4])  # plmn, gnbid, ci
+        if key not in groups:
+            groups[key] = {"nr_earfcn": r[5] or "", "rsrp_sum": 0.0, "sinr_sum": 0.0, "count": 0}
+        groups[key]["rsrp_sum"] += r[6]
+        groups[key]["sinr_sum"] += r[7]
+        groups[key]["count"] += 1
+
+    result = []
+    for (plmn, gnbid, ci), info in groups.items():
+        avg_rsrp = round(info["rsrp_sum"] / info["count"], 2) if info["count"] > 0 else None
+        avg_sinr = round(info["sinr_sum"] / info["count"], 2) if info["count"] > 0 else None
+        result.append({"nr_earfcn": info["nr_earfcn"], "gnbid": gnbid, "ci": ci,
+                        "avg_rsrp": avg_rsrp, "avg_sinr": avg_sinr, "count": info["count"]})
+    return result
+
+
+def query_point_detail(gnbid, ci, lng, lat, indoor):
+    """查询采样点详情(含邻区信息)
+    输入：gnbid, ci, lng, lat, indoor
+    输出：dict or None
+    """
+    where = 'gnbid=? AND ci=? AND lng IS NOT NULL'
+    q_params = [gnbid, ci]
+    if indoor == "1":
+        where += ' AND in_out_door="In_Door"'
+    elif indoor == "2":
+        where += ' AND in_out_door="Out_Door"'
+    where += ' AND ABS(lng-?)<0.000001 AND ABS(lat-?)<0.000001'
+    q_params.extend([lng, lat])
+
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            f'SELECT gnbid, ci, nr_earfcn, nr_ssb_rsrp, nr_ssb_sinr, '
+            f'nr_neighbor_rsrp_list, nr_neighbor_pci_list, nr_neighbor_earfcn_list '
+            f'FROM "data" WHERE {where} LIMIT 1', q_params,
+        ).fetchone()
+    finally:
+        conn.close()
+
+    if row:
+        return {"gnbid": row[0], "ci": row[1], "nr_earfcn": row[2], "nr_ssb_rsrp": row[3],
+                "nr_ssb_sinr": row[4], "nr_neighbor_rsrp_list": row[5],
+                "nr_neighbor_pci_list": row[6], "nr_neighbor_earfcn_list": row[7]}
+    return None
+
+
+@st.cache_data
+def load_base_stations():
+    """加载5GBaseStation基站数据(Streamlit缓存)
+    输出：[dict, ...] 基站记录列表
+    """
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    rows = conn.execute(
+        'SELECT "小区中文名", "物理站名", "RRU经度", "RRU纬度", "方位角", '
+        '"区县", "覆盖类型", "工作频段", "频点", "Gnbid", "Cellid", "天线挂高", "nRPCI" '
+        'FROM "5GBaseStation" '
+        'WHERE "RRU经度" IS NOT NULL AND "RRU纬度" IS NOT NULL AND "方位角" IS NOT NULL'
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+# ============================================================
+# API层：HTTP请求处理（瘦handler，调用算法层+数据层）
+# ============================================================
 
 _api_server_started = False
 
@@ -82,306 +469,63 @@ class MeasureAPI(BaseHTTPRequestHandler):
 
     def _handle_measurements(self, gnbid, ci, params, indoor):
         metric = params.get("metric", ["rsrp"])[0]
-
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            val_col = "nr_ssb_rsrp" if metric == "rsrp" else "nr_ssb_sinr"
-
-            where = 'gnbid=? AND ci=? AND longitude!="" AND latitude!="" AND ' + val_col + '!=""'
-            q_params = [gnbid, ci]
-
-            if indoor == "1":
-                where += ' AND in_out_door="In_Door"'
-            elif indoor == "2":
-                where += ' AND in_out_door="Out_Door"'
-
-            stat_row = conn.execute(
-                f'SELECT COUNT(*), AVG(CAST({val_col} AS REAL)), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=-95 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=-105 AND CAST({val_col} AS REAL)<-95 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=-115 AND CAST({val_col} AS REAL)<-105 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)<-115 THEN 1 ELSE 0 END) '
-                f'FROM "data" WHERE {where}',
-                q_params,
-            ).fetchone() if metric == "rsrp" else conn.execute(
-                f'SELECT COUNT(*), AVG(CAST({val_col} AS REAL)), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=15 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=5 AND CAST({val_col} AS REAL)<15 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)>=-3 AND CAST({val_col} AS REAL)<5 THEN 1 ELSE 0 END), '
-                f'SUM(CASE WHEN CAST({val_col} AS REAL)<-3 THEN 1 ELSE 0 END) '
-                f'FROM "data" WHERE {where}',
-                q_params,
-            ).fetchone()
-            total_count = stat_row[0] or 0
-            avg_val = round(stat_row[1], 2) if stat_row[1] is not None else None
-            grade_counts = [stat_row[2], stat_row[3], stat_row[4], stat_row[5]]
-
-            rows = conn.execute(
-                f'SELECT longitude, latitude, nr_ssb_rsrp, nr_ssb_sinr FROM "data" WHERE {where} LIMIT 5000',
-                q_params,
-            ).fetchall()
-        finally:
-            conn.close()
-
-        idx = 2 if metric == "rsrp" else 3
-        points = []
-        for r in rows:
-            if not r[0] or not r[1]:
-                continue
-            try:
-                points.append([float(r[0]), float(r[1]), float(r[idx])])
-            except (ValueError, TypeError):
-                pass
-
-        result = {"points": points, "count": total_count, "avg": avg_val, "grades": grade_counts}
+        result = query_measurements(gnbid, ci, metric, indoor)
         self._send_json(result)
 
     def _handle_grid_analysis(self, gnbid, ci, indoor):
-        # 查询小区频点
-        freq = ""
+        # 1.查询小区频点
+        freq = query_cell_freq(gnbid, ci)
+
+        # 2.查询小区采样点 + 4.查询PLMN采样点（共享DB连接）
         conn = sqlite3.connect(DB_PATH)
         try:
-            freq_row = conn.execute(
-                'SELECT "频点" FROM "5GBaseStation" WHERE "Gnbid"=? AND "Cellid"=? LIMIT 1',
-                [gnbid, ci],
-            ).fetchone()
-            if freq_row and freq_row[0]:
-                freq = str(freq_row[0])
+            cell_pts = query_cell_points(gnbid, ci, indoor, freq, conn=conn)
+            if not cell_pts:
+                self._send_json({"squares": [], "grid_params": None, "total_count": 0, "total_avg_rsrp": None, "grid_count": 0})
+                return
+
+            # 3.构建栅格（算法：坐标转换→原点计算→落格→Polygon构建）
+            avg_lat = sum(p[1] for p in cell_pts) / len(cell_pts)
+            cell_lng, cell_lat = meters_to_degrees(5.0, avg_lat)
+            origin_lng, origin_lat = calc_grid_origin(cell_pts, cell_lng, cell_lat, gnbid, ci)
+            polygons = build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat)
+
+            # 4.查询PLMN采样点+统计（算法：Shapely covers()包含判定）
+            all_bounds = [p["polygon"].bounds for p in polygons]
+            bounds = (min(b[0] for b in all_bounds), max(b[2] for b in all_bounds),
+                      min(b[1] for b in all_bounds), max(b[3] for b in all_bounds))
+            plmn_rows, total_count, total_avg = query_plmn_points_with_stats(indoor, freq, bounds, conn=conn)
         finally:
             conn.close()
+        count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng, cell_lat)
 
-        # 阶段1：查询小区采样点
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            indoor_clause = ""
-            if indoor == "1":
-                indoor_clause = ' AND in_out_door="In_Door"'
-            elif indoor == "2":
-                indoor_clause = ' AND in_out_door="Out_Door"'
-            coord_clause = ' AND longitude!="" AND latitude!=""'
-
-            cell_where = 'gnbid=? AND ci=? AND plmn="46000" AND nr_ssb_rsrp!="" AND nr_ssb_rsrp!="0" AND nr_ssb_sinr!="" AND nr_ssb_sinr!="0"' + coord_clause + indoor_clause
-            if freq:
-                cell_where += ' AND nr_earfcn=?'
-                cell_rows = conn.execute(
-                    f'SELECT longitude, latitude FROM "data" WHERE {cell_where}',
-                    [gnbid, ci, freq],
-                ).fetchall()
-            else:
-                cell_rows = conn.execute(
-                    f'SELECT longitude, latitude FROM "data" WHERE {cell_where}',
-                    [gnbid, ci],
-                ).fetchall()
-        finally:
-            conn.close()
-
-        cell_pts = []
-        for r in cell_rows:
-            try:
-                cell_pts.append((float(r[0]), float(r[1])))
-            except (ValueError, TypeError):
-                pass
-
-        if not cell_pts:
-            self._send_json({"squares": [], "grid_params": None, "total_count": 0, "total_avg_rsrp": None, "grid_count": 0})
-            return
-
-        # 阶段2：构建栅格Polygon（Shapely）
-        avg_lat = sum(p[1] for p in cell_pts) / len(cell_pts)
-        cell_lng = 5.0 / 111320.0 / math.cos(avg_lat * math.pi / 180.0)
-        cell_lat = 5.0 / 110540.0
-
-        random.seed(f"{gnbid}_{ci}")
-        ref_idx = random.randint(0, len(cell_pts) - 1)
-        origin_lng = cell_pts[ref_idx][0] - cell_lng / 2
-        origin_lat = cell_pts[ref_idx][1] - cell_lat / 2
-
-        # 小区采样点落入栅格
-        cell_grid = {}
-        for lng, lat in cell_pts:
-            gx = math.floor((lng - origin_lng) / cell_lng)
-            gy = math.floor((lat - origin_lat) / cell_lat)
-            cell_grid[(gx, gy)] = cell_grid.get((gx, gy), 0) + 1
-
-        # 构建Shapely Polygon列表
-        polygons = []
-        for (gx, gy), count in cell_grid.items():
-            sw_lng = origin_lng + gx * cell_lng
-            sw_lat = origin_lat + gy * cell_lat
-            ne_lng = origin_lng + (gx + 1) * cell_lng
-            ne_lat = origin_lat + (gy + 1) * cell_lat
-            poly = Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
-            polygons.append({
-                "gx": gx, "gy": gy,
-                "polygon": poly,
-                "cell_count": count,
-                "plmn_count": 0,
-            })
-
-        # 阶段3：cell_count已在阶段2获得
-
-        # 阶段4：通过Shapely Polygon包含关系统计总采样点数
-        all_bounds = [p["polygon"].bounds for p in polygons]
-        bounds_sw_lng = min(b[0] for b in all_bounds)
-        bounds_sw_lat = min(b[1] for b in all_bounds)
-        bounds_ne_lng = max(b[2] for b in all_bounds)
-        bounds_ne_lat = max(b[3] for b in all_bounds)
-
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            plmn_where = 'plmn="46000" AND nr_ssb_rsrp!="" AND nr_ssb_rsrp!="0" AND nr_ssb_sinr!="" AND nr_ssb_sinr!="0"' + coord_clause + indoor_clause
-            if freq:
-                plmn_where += ' AND nr_earfcn=?'
-            plmn_where += ' AND CAST(longitude AS REAL)>=? AND CAST(longitude AS REAL)<=? AND CAST(latitude AS REAL)>=? AND CAST(latitude AS REAL)<=?'
-            bounds_params = [bounds_sw_lng, bounds_ne_lng, bounds_sw_lat, bounds_ne_lat]
-            if freq:
-                plmn_params = [freq] + bounds_params
-            else:
-                plmn_params = bounds_params
-
-            total_row = conn.execute(
-                f'SELECT COUNT(*), AVG(CAST(nr_ssb_rsrp AS REAL)) FROM "data" WHERE {plmn_where}',
-                plmn_params,
-            ).fetchone()
-            total_count = total_row[0] or 0
-            total_avg = round(total_row[1], 2) if total_row[1] is not None else None
-
-            plmn_rows = conn.execute(
-                f'SELECT longitude, latitude FROM "data" WHERE {plmn_where}',
-                plmn_params,
-            ).fetchall()
-        finally:
-            conn.close()
-
-        # Shapely Polygon.covers 判定包含关系
-        poly_map = {(p["gx"], p["gy"]): p for p in polygons}
-        for r in plmn_rows:
-            try:
-                lng, lat = float(r[0]), float(r[1])
-            except (ValueError, TypeError):
-                continue
-            pt = Point(lng, lat)
-            gx = math.floor((lng - origin_lng) / cell_lng)
-            gy = math.floor((lat - origin_lat) / cell_lat)
-            key = (gx, gy)
-            if key in poly_map and poly_map[key]["polygon"].covers(pt):
-                poly_map[key]["plmn_count"] += 1
-
-        # 阶段5：计算覆盖率并构建结果
+        # 5.计算覆盖率并构建结果（算法：cell_count/plmn_count）
         squares = []
         for p in polygons:
-            pct = round(p["cell_count"] / p["plmn_count"] * 100) if p["plmn_count"] > 0 else 0
+            pct = calc_coverage(p["cell_count"], p["plmn_count"])
             bounds = p["polygon"].bounds
             squares.append({
-                "sw_lng": bounds[0],
-                "sw_lat": bounds[1],
-                "ne_lng": bounds[2],
-                "ne_lat": bounds[3],
-                "gx": p["gx"],
-                "gy": p["gy"],
-                "count": p["cell_count"],
-                "plmn_count": p["plmn_count"],
-                "pct": pct,
+                "sw_lng": bounds[0], "sw_lat": bounds[1], "ne_lng": bounds[2], "ne_lat": bounds[3],
+                "gx": p["gx"], "gy": p["gy"],
+                "count": p["cell_count"], "plmn_count": p["plmn_count"], "pct": pct,
             })
 
-        result = {
+        self._send_json({
             "squares": squares,
-            "grid_params": {
-                "origin_lng": origin_lng,
-                "origin_lat": origin_lat,
-                "cell_lng": cell_lng,
-                "cell_lat": cell_lat,
-                "freq": freq,
-            },
-            "total_count": total_count,
-            "total_avg_rsrp": total_avg,
-            "grid_count": len(squares),
-        }
-        self._send_json(result)
+            "grid_params": {"origin_lng": origin_lng, "origin_lat": origin_lat,
+                            "cell_lng": cell_lng, "cell_lat": cell_lat, "freq": freq},
+            "total_count": total_count, "total_avg_rsrp": total_avg, "grid_count": len(squares),
+        })
 
     def _handle_grid_cell_detail(self, origin_lng, origin_lat, cell_lng, cell_lat, gx, gy, indoor, freq):
-        # 从栅格参数重建同一个Shapely Polygon
-        origin_lng = float(origin_lng)
-        origin_lat = float(origin_lat)
-        cell_lng = float(cell_lng)
-        cell_lat = float(cell_lat)
-        gx = int(gx)
-        gy = int(gy)
-        sw_lng = origin_lng + gx * cell_lng
-        sw_lat = origin_lat + gy * cell_lat
-        ne_lng = origin_lng + (gx + 1) * cell_lng
-        ne_lat = origin_lat + (gy + 1) * cell_lat
-        poly = Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
-
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            where = 'plmn="46000" AND nr_ssb_rsrp!="" AND nr_ssb_rsrp!="0" AND nr_ssb_sinr!="" AND nr_ssb_sinr!="0" AND longitude!="" AND latitude!=""'
-            if indoor == "1":
-                where += ' AND in_out_door="In_Door"'
-            elif indoor == "2":
-                where += ' AND in_out_door="Out_Door"'
-            if freq:
-                where += ' AND nr_earfcn=?'
-            where += ' AND CAST(longitude AS REAL)>=? AND CAST(longitude AS REAL)<=? AND CAST(latitude AS REAL)>=? AND CAST(latitude AS REAL)<=?'
-            q_params = []
-            if freq:
-                q_params.append(freq)
-            q_params.extend([sw_lng, ne_lng, sw_lat, ne_lat])
-            rows = conn.execute(
-                f'SELECT longitude, latitude, plmn, gnbid, ci, nr_earfcn, CAST(nr_ssb_rsrp AS REAL), CAST(nr_ssb_sinr AS REAL) '
-                f'FROM "data" WHERE {where}',
-                q_params,
-            ).fetchall()
-        finally:
-            conn.close()
-
-        # Shapely Polygon.covers 判定包含关系，与grid_analysis完全一致
-        groups = {}
-        for r in rows:
-            try:
-                lng, lat = float(r[0]), float(r[1])
-            except (ValueError, TypeError):
-                continue
-            if not poly.covers(Point(lng, lat)):
-                continue
-            key = (r[2], r[3], r[4])  # plmn, gnbid, ci
-            if key not in groups:
-                groups[key] = {"nr_earfcn": r[5] or "", "rsrp_sum": 0.0, "sinr_sum": 0.0, "count": 0}
-            rsrp = r[6] if r[6] else 0.0
-            sinr = r[7] if r[7] else 0.0
-            groups[key]["rsrp_sum"] += rsrp
-            groups[key]["sinr_sum"] += sinr
-            groups[key]["count"] += 1
-
-        result = []
-        for (plmn, gnbid, ci), info in groups.items():
-            avg_rsrp = round(info["rsrp_sum"] / info["count"], 2) if info["count"] > 0 else None
-            avg_sinr = round(info["sinr_sum"] / info["count"], 2) if info["count"] > 0 else None
-            result.append({"nr_earfcn": info["nr_earfcn"], "gnbid": gnbid, "ci": ci, "avg_rsrp": avg_rsrp, "avg_sinr": avg_sinr, "count": info["count"]})
+        # 从栅格参数重建Polygon（算法：避免精度丢失）
+        poly = reconstruct_polygon(origin_lng, origin_lat, cell_lng, cell_lat, gx, gy)
+        result = query_grid_detail_points(poly, indoor, freq)
         self._send_json(result)
 
     def _handle_point_detail(self, gnbid, ci, lng, lat, indoor):
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            where = 'gnbid=? AND ci=? AND longitude!="" AND latitude!=""'
-            q_params = [gnbid, ci]
-            if indoor == "1":
-                where += ' AND in_out_door="In_Door"'
-            elif indoor == "2":
-                where += ' AND in_out_door="Out_Door"'
-            where += ' AND ABS(CAST(longitude AS REAL)-?)<0.000001 AND ABS(CAST(latitude AS REAL)-?)<0.000001'
-            q_params.extend([lng, lat])
-            row = conn.execute(
-                f'SELECT gnbid, ci, nr_earfcn, nr_ssb_rsrp, nr_ssb_sinr, nr_neighbor_rsrp_list, nr_neighbor_pci_list, nr_neighbor_earfcn_list '
-                f'FROM "data" WHERE {where} LIMIT 1',
-                q_params,
-            ).fetchone()
-        finally:
-            conn.close()
-        if row:
-            self._send_json({"gnbid": row[0], "ci": row[1], "nr_earfcn": row[2], "nr_ssb_rsrp": row[3], "nr_ssb_sinr": row[4], "nr_neighbor_rsrp_list": row[5], "nr_neighbor_pci_list": row[6], "nr_neighbor_earfcn_list": row[7]})
-        else:
-            self._send_json(None)
+        result = query_point_detail(gnbid, ci, lng, lat, indoor)
+        self._send_json(result)
 
     def _send_json(self, result):
         body = json.dumps(result).encode()
@@ -409,23 +553,9 @@ def start_api_server():
         pass
 
 
-# --- Data loading ---
-
-@st.cache_data
-def load_data():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    rows = conn.execute(
-        'SELECT "小区中文名", "物理站名", "RRU经度", "RRU纬度", "方位角", '
-        '"区县", "覆盖类型", "工作频段", "频点", "Gnbid", "Cellid", "天线挂高", "nRPCI" '
-        'FROM "5GBaseStation" '
-        'WHERE "RRU经度" IS NOT NULL AND "RRU纬度" IS NOT NULL AND "方位角" IS NOT NULL'
-    ).fetchall()
-    conn.close()
-    return [dict(r) for r in rows]
-
-
-# --- HTML template ---
+# ============================================================
+# 呈现层：HTML/JS模板 + Streamlit入口
+# ============================================================
 
 def build_map_html(sectors_json):
     rsrp_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in RSRP_GRADES])
@@ -801,7 +931,6 @@ def build_map_html(sectors_json):
   }}
 
   function loadScatter(name, metric) {{
-    // Only remove existing scatter data, keep entry as placeholder to track in-flight request
     if (scatterByCell[name] && scatterByCell[name].markers) {{
       scatterByCell[name].markers.forEach(function(m) {{ m.setMap(null); }});
     }}
@@ -824,7 +953,6 @@ def build_map_html(sectors_json):
           pendingLoads = 0;
         }}
         if (mySeq !== scatterLoadSeq[name]) return;
-        // If deselected while fetch was in-flight, discard and clean up
         if (selected.indexOf(name) < 0) {{
           delete scatterByCell[name];
           return;
@@ -966,7 +1094,6 @@ def build_map_html(sectors_json):
         gridByCell[name].gridPolygons.forEach(function(gp) {{ gp.setMap(null); }});
       }}
     }});
-    // Show scatter markers
     Object.keys(scatterByCell).forEach(function(name) {{
       if (scatterByCell[name].markers) {{
         scatterByCell[name].markers.forEach(function(m) {{ m.setMap(map); }});
@@ -975,7 +1102,6 @@ def build_map_html(sectors_json):
   }}
 
   function showGrid() {{
-    // Hide scatter markers
     Object.keys(scatterByCell).forEach(function(name) {{
       if (scatterByCell[name].markers) {{
         scatterByCell[name].markers.forEach(function(m) {{ m.setMap(null); }});
@@ -1125,7 +1251,6 @@ def build_map_html(sectors_json):
       var g = PCT_GRADES[i];
       var sqCnt = gradeSquareCounts[i];
       var cellCnt = gradeCellCounts[i];
-      var plmnCnt = gradePlmnCounts[i];
       var smpPct = totalCellCount > 0 ? (cellCnt / totalCellCount * 100).toFixed(1) : "0.0";
       legendHtml += '<div class="legend-item">' +
         '<span class="legend-dot" style="background:' + g.color + '"></span>' +
@@ -1253,7 +1378,6 @@ def build_map_html(sectors_json):
       document.getElementById("btn-scatter").classList.add("active");
       document.getElementById("btn-grid").classList.remove("active");
       document.getElementById("scatter-controls").style.display = "block";
-      // Load scatter data for selected cells if not already loaded
       selected.forEach(function(name) {{
         if (!scatterByCell[name] || scatterByCell[name].loading) {{
           loadScatter(name, currentMetric);
@@ -1268,7 +1392,6 @@ def build_map_html(sectors_json):
       document.getElementById("btn-grid").classList.add("active");
       document.getElementById("btn-scatter").classList.remove("active");
       document.getElementById("scatter-controls").style.display = "none";
-      // Load grid data for selected cells if not already loaded
       selected.forEach(function(name) {{
         if (!gridByCell[name] || gridByCell[name].loading) {{
           loadGrid(name);
@@ -1327,7 +1450,7 @@ def main():
 
     start_api_server()
 
-    data = load_data()
+    data = load_base_stations()
 
     sectors = [
         {
