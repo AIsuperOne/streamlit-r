@@ -43,6 +43,18 @@ PCT_GRADES = [
     {"label": "高覆盖", "range": "80~100%", "color": "#2ECC71"},
 ]
 
+COVERAGE_GRADES = [
+    {"label": "未覆盖", "range": "RSRP≤-105或SINR≤-3", "color": "#E74C3C"},
+    {"label": "覆盖", "range": "RSRP>-105且SINR>-3", "color": "#2ECC71"},
+]
+
+WEAK_GRADES = [
+    {"label": "覆盖优良", "range": "0~20%", "color": "#2ECC71"},
+    {"label": "覆盖良好", "range": "20~50%", "color": "#F1C40F"},
+    {"label": "覆盖稍弱", "range": "50~80%", "color": "#E67E22"},
+    {"label": "覆盖很弱", "range": "80~100%", "color": "#E74C3C"},
+]
+
 
 # ============================================================
 # 算法层：纯函数，无副作用，不访问数据库
@@ -104,7 +116,7 @@ def build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat):
         ne_lng = origin_lng + (gx + 1) * cell_lng
         ne_lat = origin_lat + (gy + 1) * cell_lat
         poly = Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
-        polygons.append({"gx": gx, "gy": gy, "polygon": poly, "cell_count": count, "plmn_count": 0})
+        polygons.append({"gx": gx, "gy": gy, "polygon": poly, "cell_count": count, "plmn_count": 0, "weak_count": 0})
     return polygons
 
 
@@ -112,8 +124,9 @@ def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng
     """【PLMN统计】用Shapely covers()判定PLMN采样点落入栅格
     实现：先数学落格快速定位候选栅格(gx,gy)，再Shapely covers()精确判定
          两步过滤：数学落格O(1)定位→covers()精确排除边界点
-    输入：plmn_rows[(lng,lat),...], polygons, origin_lng, origin_lat, cell_lng, cell_lat
-    输出：无返回，直接修改polygons[i]["plmn_count"]
+         同时统计弱覆盖点(rsrp<-105或sinr<-3)
+    输入：plmn_rows[(lng,lat,rsrp,sinr),...], polygons, origin_lng, origin_lat, cell_lng, cell_lat
+    输出：无返回，直接修改polygons[i]["plmn_count"]和polygons[i]["weak_count"]
     """
     poly_map = {(p["gx"], p["gy"]): p for p in polygons}
     for r in plmn_rows:
@@ -125,6 +138,9 @@ def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng
         key = (gx, gy)
         if key in poly_map and poly_map[key]["polygon"].covers(pt):
             poly_map[key]["plmn_count"] += 1
+            rsrp, sinr = r[2], r[3]
+            if rsrp is not None and sinr is not None and (rsrp < -105 or sinr < -3):
+                poly_map[key]["weak_count"] += 1
 
 
 def calc_coverage(cell_count, plmn_count):
@@ -153,6 +169,19 @@ def reconstruct_polygon(origin_lng, origin_lat, cell_lng, cell_lat, gx, gy):
     return Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
 
 
+def calc_bearing(lng1, lat1, lng2, lat2):
+    """【方位角计算】Haversine公式计算从(lng1,lat1)到(lng2,lat2)的方位角
+    实现：正北为0°，顺时针增长，与JS端calcBearing逻辑一致
+    输入：lng1, lat1, lng2, lat2（经纬度）
+    输出：float 方位角 0~360°
+    """
+    d_lng = math.radians(lng2 - lng1)
+    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
+    y = math.sin(d_lng) * math.cos(lat2_r)
+    x = math.cos(lat1_r) * math.sin(lat2_r) - math.sin(lat1_r) * math.cos(lat2_r) * math.cos(d_lng)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
 def build_where(indoor, freq=None, with_cell=False, with_plmn=False,
                 with_signal=False, with_coords=False, with_bounds=False):
     """【SQL条件构建】统一构建WHERE子句及参数
@@ -171,7 +200,7 @@ def build_where(indoor, freq=None, with_cell=False, with_plmn=False,
     if with_plmn:
         conditions.append('plmn="46000"')
     if with_signal:
-        conditions.extend(['nr_ssb_rsrp!=""', 'nr_ssb_rsrp!="0"', 'nr_ssb_sinr!=""', 'nr_ssb_sinr!="0"'])
+        conditions.extend(['rsrp IS NOT NULL', 'sinr IS NOT NULL'])
     if with_coords:
         conditions.append("lng IS NOT NULL")
     if indoor == "1":
@@ -187,22 +216,6 @@ def build_where(indoor, freq=None, with_cell=False, with_plmn=False,
 
     where = " AND ".join(conditions)
     return where, params
-
-
-def parse_float_rows(rows, *indices):
-    """【数据解析】从DB行中安全提取浮点数
-    实现：跳过空值和转换异常
-    输入：rows(DB行列表), indices(需要解析为float的列索引)
-    输出：解析后的元组列表，异常行跳过
-    """
-    result = []
-    for r in rows:
-        try:
-            vals = tuple(float(r[i]) for i in indices)
-            result.append(vals)
-        except (ValueError, TypeError):
-            pass
-    return result
 
 
 # ============================================================
@@ -249,6 +262,7 @@ def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
     输入：indoor, freq, bounds(sw_lng, ne_lng, sw_lat, ne_lat), conn(可选，外部连接)
     输出：(plmn_rows, total_count, total_avg_rsrp)
     优化：用覆盖索引(plmn,nr_earfcn,lng,lat,rsrp)直接取lng/lat/rsrp，Python端统计
+          sinr不在覆盖索引中需回表，用于弱覆盖计算
     """
     where, params = build_where(indoor, freq=freq, with_plmn=True,
                                 with_coords=True, with_bounds=True)
@@ -259,7 +273,7 @@ def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
         conn = sqlite3.connect(DB_PATH)
     try:
         rows = conn.execute(
-            f'SELECT lng, lat, rsrp FROM "data" WHERE {where}', params
+            f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where}', params
         ).fetchall()
     finally:
         if own_conn:
@@ -271,7 +285,7 @@ def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
     for r in rows:
         if r[0] is None or r[1] is None:
             continue
-        plmn_rows.append((r[0], r[1]))
+        plmn_rows.append((r[0], r[1], r[2], r[3]))
         if r[2] is not None:
             rsrp_sum += r[2]
             rsrp_count += 1
@@ -282,9 +296,44 @@ def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
 
 def query_measurements(gnbid, ci, metric, indoor):
     """查询散点测量数据(点列表+统计+等级)
-    输入：gnbid, ci, metric(rsrp/sinr), indoor
+    输入：gnbid, ci, metric(rsrp/sinr/coverage), indoor
     输出：{points, count, avg, grades}
     """
+    if metric == "coverage":
+        where = 'gnbid=? AND ci=? AND lng IS NOT NULL AND rsrp IS NOT NULL AND sinr IS NOT NULL'
+        q_params = [gnbid, ci]
+        if indoor == "1":
+            where += ' AND in_out_door="In_Door"'
+        elif indoor == "2":
+            where += ' AND in_out_door="Out_Door"'
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            stat_row = conn.execute(
+                f'SELECT COUNT(*), '
+                f'SUM(CASE WHEN rsrp>-105 AND sinr>-3 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN NOT(rsrp>-105 AND sinr>-3) THEN 1 ELSE 0 END) '
+                f'FROM "data" WHERE {where}', q_params,
+            ).fetchone()
+            total_count = stat_row[0] or 0
+            covered = stat_row[1] or 0
+            not_covered = stat_row[2] or 0
+            avg_val = round(covered / total_count * 100, 2) if total_count > 0 else None
+
+            rows = conn.execute(
+                f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where} LIMIT 5000',
+                q_params,
+            ).fetchall()
+        finally:
+            conn.close()
+
+        points = []
+        for r in rows:
+            if r[0] is None or r[1] is None or r[2] is None or r[3] is None:
+                continue
+            covered_flag = 1 if (r[2] > -105 and r[3] > -3) else 0
+            points.append([r[0], r[1], covered_flag])
+        return {"points": points, "count": total_count, "avg": avg_val, "grades": [not_covered, covered]}
+
     val_col = "rsrp" if metric == "rsrp" else "sinr"
     where = f'gnbid=? AND ci=? AND lng IS NOT NULL AND {val_col} IS NOT NULL'
     q_params = [gnbid, ci]
@@ -319,18 +368,17 @@ def query_measurements(gnbid, ci, metric, indoor):
         grade_counts = [stat_row[2], stat_row[3], stat_row[4], stat_row[5]]
 
         rows = conn.execute(
-            f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where} LIMIT 5000',
+            f'SELECT lng, lat, {val_col} FROM "data" WHERE {where} LIMIT 5000',
             q_params,
         ).fetchall()
     finally:
         conn.close()
 
-    idx = 2 if metric == "rsrp" else 3
     points = []
     for r in rows:
-        if r[0] is None or r[1] is None or r[idx] is None:
+        if r[0] is None or r[1] is None or r[2] is None:
             continue
-        points.append([r[0], r[1], r[idx]])
+        points.append([r[0], r[1], r[2]])
 
     return {"points": points, "count": total_count, "avg": avg_val, "grades": grade_counts}
 
@@ -412,6 +460,67 @@ def query_point_detail(gnbid, ci, lng, lat, indoor):
     return None
 
 
+def query_optimal_azimuth(gnbid, ci, indoor):
+    """查询最优方位角
+    算法：1.从5GBaseStation取小区经纬度和当前方位角
+         2.查询该小区采样点(lng,lat)，按indoor筛选
+         3.对每个采样点计算相对小区的方位角(bearing)
+         4.用区间覆盖法O(N)计算每个5°角度的波束内点数
+         5.点数最多的角度为最优方位角
+    输入：gnbid, ci, indoor(0=全部,1=室内,2=室外)
+    输出：{optimal_azimuth, optimal_ratio, current_azimuth, current_ratio, total_count}
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        row = conn.execute(
+            'SELECT "RRU经度", "RRU纬度", "方位角" FROM "5GBaseStation" WHERE "Gnbid"=? AND "Cellid"=? LIMIT 1',
+            [gnbid, ci],
+        ).fetchone()
+        if not row or not row[0] or not row[1] or row[2] is None:
+            return {"optimal_azimuth": None, "optimal_ratio": None,
+                    "current_azimuth": None, "current_ratio": None, "total_count": 0}
+        cell_lng, cell_lat, current_azimuth = float(row[0]), float(row[1]), float(row[2])
+
+        where = 'gnbid=? AND ci=? AND lng IS NOT NULL'
+        params = [gnbid, ci]
+        if indoor == "1":
+            where += ' AND in_out_door="In_Door"'
+        elif indoor == "2":
+            where += ' AND in_out_door="Out_Door"'
+
+        points = conn.execute(f'SELECT lng, lat FROM "data" WHERE {where}', params).fetchall()
+    finally:
+        conn.close()
+
+    bearings = [calc_bearing(cell_lng, cell_lat, p[0], p[1]) for p in points if p[0] is not None and p[1] is not None]
+
+    if not bearings:
+        return {"optimal_azimuth": None, "optimal_ratio": None,
+                "current_azimuth": current_azimuth, "current_ratio": None, "total_count": 0}
+
+    half_beam_steps = int(BEAM_WIDTH / 2 / 5)  # 30°/5 = 6
+    angle_counts = [0] * 72
+    for b in bearings:
+        center = int(round(b / 5)) % 72
+        for offset in range(-half_beam_steps, half_beam_steps + 1):
+            angle_counts[(center + offset) % 72] += 1
+
+    best_idx = max(range(72), key=lambda i: angle_counts[i])
+    best_angle = best_idx * 5
+    best_count = angle_counts[best_idx]
+
+    current_center = int(round(current_azimuth / 5)) % 72
+    current_count = angle_counts[current_center]
+
+    return {
+        "optimal_azimuth": best_angle,
+        "optimal_ratio": round(best_count / len(bearings) * 100, 1),
+        "current_azimuth": current_azimuth,
+        "current_ratio": round(current_count / len(bearings) * 100, 1),
+        "total_count": len(bearings),
+    }
+
+
 @st.cache_data
 def load_base_stations():
     """加载5GBaseStation基站数据(Streamlit缓存)
@@ -465,6 +574,10 @@ class MeasureAPI(BaseHTTPRequestHandler):
             self._handle_point_detail(gnbid, ci, lng, lat, indoor)
             return
 
+        if path == "/api/optimal_azimuth":
+            self._handle_optimal_azimuth(gnbid, ci, indoor)
+            return
+
         self._handle_measurements(gnbid, ci, params, indoor)
 
     def _handle_measurements(self, gnbid, ci, params, indoor):
@@ -503,11 +616,13 @@ class MeasureAPI(BaseHTTPRequestHandler):
         squares = []
         for p in polygons:
             pct = calc_coverage(p["cell_count"], p["plmn_count"])
+            weak_pct = round(p["weak_count"] / p["plmn_count"] * 100) if p["plmn_count"] > 0 else 0
             bounds = p["polygon"].bounds
             squares.append({
                 "sw_lng": bounds[0], "sw_lat": bounds[1], "ne_lng": bounds[2], "ne_lat": bounds[3],
                 "gx": p["gx"], "gy": p["gy"],
                 "count": p["cell_count"], "plmn_count": p["plmn_count"], "pct": pct,
+                "weak_count": p["weak_count"], "weak_pct": weak_pct,
             })
 
         self._send_json({
@@ -525,6 +640,10 @@ class MeasureAPI(BaseHTTPRequestHandler):
 
     def _handle_point_detail(self, gnbid, ci, lng, lat, indoor):
         result = query_point_detail(gnbid, ci, lng, lat, indoor)
+        self._send_json(result)
+
+    def _handle_optimal_azimuth(self, gnbid, ci, indoor):
+        result = query_optimal_azimuth(gnbid, ci, indoor)
         self._send_json(result)
 
     def _send_json(self, result):
@@ -561,6 +680,8 @@ def build_map_html(sectors_json):
     rsrp_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in RSRP_GRADES])
     sinr_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in SINR_GRADES])
     pct_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in PCT_GRADES])
+    coverage_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in COVERAGE_GRADES])
+    weak_grades_json = json.dumps([{"label": g["label"], "range": g["range"], "color": g["color"]} for g in WEAK_GRADES])
     return f"""<!DOCTYPE html>
 <html>
 <head>
@@ -657,6 +778,13 @@ def build_map_html(sectors_json):
       <button class="active" id="btn-rsrp">RSRP</button>
       <button id="btn-sinr">SINR</button>
       <button id="btn-beam">波束</button>
+      <button id="btn-coverage">覆盖率</button>
+    </div>
+    </div>
+    <div id="grid-controls" style="display:none;">
+    <div class="metric-toggle">
+      <button class="active" id="btn-cell-pct">小区占比</button>
+      <button id="btn-weak-pct">覆盖比例</button>
     </div>
     </div>
     <select id="indoor-select">
@@ -677,7 +805,9 @@ def build_map_html(sectors_json):
 
   var GRADES = {{
     rsrp: {rsrp_grades_json},
-    sinr: {sinr_grades_json}
+    sinr: {sinr_grades_json},
+    coverage: {coverage_grades_json},
+    weak: {weak_grades_json}
   }};
 
   var PCT_GRADES = {pct_grades_json};
@@ -687,6 +817,7 @@ def build_map_html(sectors_json):
   var selected = [];
   var currentMetric = "rsrp";
   var viewMode = "scatter";
+  var gridMode = "cell";
   var scatterByCell = {{}};
   var gridByCell = {{}};
   var pendingLoads = 0;
@@ -777,7 +908,7 @@ def build_map_html(sectors_json):
   }}
 
   var s = document.createElement("script");
-  s.src = "https://webapi.amap.com/maps?v=2.0&key={AMAP_KEY}";
+  s.src = "https://webapi.amap.com/maps?v=2.0&key={AMAP_KEY}&plugin=AMap.Map3D";
   s.onload = init;
   document.head.appendChild(s);
 
@@ -820,6 +951,17 @@ def build_map_html(sectors_json):
     return "#E74C3C";
   }}
 
+  function coverageColor(v) {{
+    return v >= 1 ? "#2ECC71" : "#E74C3C";
+  }}
+
+  function weakColor(pct) {{
+    if (pct >= 80) return "#E74C3C";
+    if (pct >= 50) return "#E67E22";
+    if (pct >= 20) return "#F1C40F";
+    return "#2ECC71";
+  }}
+
   function calcBearing(lng1, lat1, lng2, lat2) {{
     var dLng = (lng2 - lng1) * Math.PI / 180;
     var lat1R = lat1 * Math.PI / 180;
@@ -842,7 +984,7 @@ def build_map_html(sectors_json):
   function GridPolygon(sq, gridParams) {{
     this.sq = sq;
     this.gridParams = gridParams;
-    var color = pctColor(sq.pct);
+    var color = gridMode === "weak" ? weakColor(sq.weak_pct) : pctColor(sq.pct);
     this.polygon = new AMap.Polygon({{
       path: [
         [sq.sw_lng, sq.sw_lat],
@@ -870,12 +1012,24 @@ def build_map_html(sectors_json):
     return [(sq.sw_lng + sq.ne_lng) / 2, (sq.sw_lat + sq.ne_lat) / 2];
   }};
 
+  function updateGridColors() {{
+    Object.keys(gridByCell).forEach(function(name) {{
+      if (!gridByCell[name] || !gridByCell[name].gridPolygons) return;
+      gridByCell[name].gridPolygons.forEach(function(gp) {{
+        var pct = gridMode === "weak" ? gp.sq.weak_pct : gp.sq.pct;
+        var colorFn = gridMode === "weak" ? weakColor : pctColor;
+        var color = colorFn(pct);
+        gp.polygon.setOptions({{ fillColor: color, strokeColor: color }});
+      }});
+    }});
+  }}
+
   function init() {{
     var lats = sectors.map(function(s){{ return s.lat; }}).filter(function(v){{ return v && !isNaN(v); }});
     var lngs = sectors.map(function(s){{ return s.lng; }}).filter(function(v){{ return v && !isNaN(v); }});
     var cLat = lats.reduce(function(a,b){{ return a+b; }}, 0) / lats.length;
     var cLng = lngs.reduce(function(a,b){{ return a+b; }}, 0) / lngs.length;
-    map = new AMap.Map("container", {{ zoom: 13, center: [cLng, cLat] }});
+    map = new AMap.Map("container", {{ zoom: 13, center: [cLng, cLat], viewMode: '3D', pitch: 50, rotation: 0 }});
     addSectors();
     setupSearch();
     setupRadius();
@@ -967,6 +1121,8 @@ def build_map_html(sectors_json):
               color = beamColor(p[0], p[1], s);
               if (isInBeam(calcBearing(s.lng, s.lat, p[0], p[1]), s.azimuth)) beamIn++;
               else beamOut++;
+            }} else if (metric === "coverage") {{
+              color = coverageColor(p[2]);
             }} else {{
               var colorFn = metric === "rsrp" ? rsrpColor : sinrColor;
               color = colorFn(p[2]);
@@ -995,8 +1151,24 @@ def build_map_html(sectors_json):
           avg: result.avg,
           grades: result.grades,
           beamIn: metric === "beam" ? beamIn : 0,
-          beamOut: metric === "beam" ? beamOut : 0
+          beamOut: metric === "beam" ? beamOut : 0,
+          optimalAzimuth: null,
+          optimalRatio: null,
+          currentRatio: null
         }};
+        if (metric === "beam") {{
+          fetch("http://localhost:{API_PORT}/api/optimal_azimuth?gnbid=" + encodeURIComponent(s.gnbid) + "&ci=" + encodeURIComponent(s.ci) + "&indoor=" + indoor)
+            .then(function(r) {{ return r.json(); }})
+            .then(function(opt) {{
+              if (mySeq !== scatterLoadSeq[name]) return;
+              if (scatterByCell[name]) {{
+                scatterByCell[name].optimalAzimuth = opt.optimal_azimuth;
+                scatterByCell[name].optimalRatio = opt.optimal_ratio;
+                scatterByCell[name].currentRatio = opt.current_ratio;
+                renderStats();
+              }}
+            }});
+        }}
         renderStats();
       }})
       .catch(function() {{
@@ -1133,12 +1305,18 @@ def build_map_html(sectors_json):
 
     if (currentMetric === "beam") {{
       var totalCount = 0, totalIn = 0, totalOut = 0;
+      var bestOptimal = null, bestOptimalRatio = -1, bestCurrentRatio = null;
       names.forEach(function(name) {{
         var info = scatterByCell[name];
         if (info) {{
           totalCount += info.count;
           totalIn += info.beamIn || 0;
           totalOut += info.beamOut || 0;
+          if (info.optimalRatio != null && info.optimalRatio > bestOptimalRatio) {{
+            bestOptimalRatio = info.optimalRatio;
+            bestOptimal = info.optimalAzimuth;
+            bestCurrentRatio = info.currentRatio;
+          }}
         }}
       }});
       var inPct = totalCount > 0 ? (totalIn / totalCount * 100).toFixed(1) : "0.0";
@@ -1147,20 +1325,46 @@ def build_map_html(sectors_json):
       html += '<div class="stat-row"><span>波束内</span><span class="stat-val">' + totalIn + '</span></div>';
       html += '<div class="stat-row"><span>波束外</span><span class="stat-val">' + totalOut + '</span></div>';
       html += '<div class="stat-row"><span>波束内占比</span><span class="stat-val">' + inPct + '%</span></div>';
+      if (bestOptimal != null) {{
+        html += '<div class="stat-row" style="color:#2ECC71"><span>最优方位角</span><span class="stat-val">' + bestOptimal + '° (' + bestOptimalRatio + '%)</span></div>';
+      }}
+      if (bestCurrentRatio != null) {{
+        html += '<div class="stat-row"><span>当前方位角占比</span><span class="stat-val">' + bestCurrentRatio + '%</span></div>';
+      }}
+      statsEl.innerHTML = html;
+      return;
+    }}
+
+    if (currentMetric === "coverage") {{
+      var totalCount = 0, totalCovered = 0, totalNotCovered = 0;
+      names.forEach(function(name) {{
+        var info = scatterByCell[name];
+        if (info && info.grades) {{
+          totalCount += info.count;
+          totalNotCovered += info.grades[0] || 0;
+          totalCovered += info.grades[1] || 0;
+        }}
+      }});
+      var covPct = totalCount > 0 ? (totalCovered / totalCount * 100).toFixed(1) : "0.0";
+
+      var html = '<div class="stat-row"><span>采样点数</span><span class="stat-val">' + totalCount + '</span></div>';
+      html += '<div class="stat-row"><span>覆盖点数</span><span class="stat-val">' + totalCovered + '</span></div>';
+      html += '<div class="stat-row"><span>未覆盖点数</span><span class="stat-val">' + totalNotCovered + '</span></div>';
+      html += '<div class="stat-row"><span>覆盖率</span><span class="stat-val">' + covPct + '%</span></div>';
       statsEl.innerHTML = html;
 
+      var notCovPct = totalCount > 0 ? (totalNotCovered / totalCount * 100).toFixed(1) : "0.0";
       var legendHtml = '<div class="legend-item">' +
         '<span class="legend-dot" style="background:#2ECC71"></span>' +
-        '<span class="legend-label">波束内(±60°)</span>' +
-        '<span class="legend-count">' + totalIn + '</span>' +
-        '<span class="legend-pct">' + inPct + '%</span>' +
+        '<span class="legend-label">覆盖(RSRP>-105且SINR>-3)</span>' +
+        '<span class="legend-count">' + totalCovered + '</span>' +
+        '<span class="legend-pct">' + covPct + '%</span>' +
       '</div>';
-      var outPct = totalCount > 0 ? (totalOut / totalCount * 100).toFixed(1) : "0.0";
       legendHtml += '<div class="legend-item">' +
         '<span class="legend-dot" style="background:#E74C3C"></span>' +
-        '<span class="legend-label">波束外</span>' +
-        '<span class="legend-count">' + totalOut + '</span>' +
-        '<span class="legend-pct">' + outPct + '%</span>' +
+        '<span class="legend-label">未覆盖</span>' +
+        '<span class="legend-count">' + totalNotCovered + '</span>' +
+        '<span class="legend-pct">' + notCovPct + '%</span>' +
       '</div>';
       legendEl.innerHTML = legendHtml;
       return;
@@ -1209,6 +1413,53 @@ def build_map_html(sectors_json):
   function renderGridStats(statsEl, legendEl) {{
     var names = Object.keys(gridByCell);
     if (names.length === 0) return;
+
+    if (gridMode === "weak") {{
+      var totalGridCount = 0;
+      var totalPlmnCount = 0;
+      var totalWeakCount = 0;
+      var gradeSquareCounts = [0, 0, 0, 0];
+      var gradePlmnCounts = [0, 0, 0, 0];
+
+      names.forEach(function(name) {{
+        var info = gridByCell[name];
+        if (!info || info.loading) return;
+        totalGridCount += info.grid_count;
+        if (info.squares) {{
+          info.squares.forEach(function(sq) {{
+            var wp = sq.weak_pct;
+            var gi = wp >= 80 ? 3 : wp >= 50 ? 2 : wp >= 20 ? 1 : 0;
+            gradeSquareCounts[gi]++;
+            gradePlmnCounts[gi] += sq.plmn_count;
+            totalPlmnCount += sq.plmn_count;
+            totalWeakCount += sq.weak_count || 0;
+          }});
+        }}
+      }});
+
+      var area = totalGridCount * 25;
+      var weakPct = totalPlmnCount > 0 ? (totalWeakCount / totalPlmnCount * 100).toFixed(1) : "0.0";
+
+      var html = '<div class="stat-row"><span>栅格数</span><span class="stat-val">' + totalGridCount + '</span></div>';
+      html += '<div class="stat-row"><span>覆盖面积</span><span class="stat-val">' + area + ' m²</span></div>';
+      html += '<div class="stat-row"><span>弱覆盖占比</span><span class="stat-val">' + weakPct + '%</span></div>';
+      statsEl.innerHTML = html;
+
+      var legendHtml = "";
+      for (var i = 0; i < GRADES.weak.length; i++) {{
+        var g = GRADES.weak[i];
+        var sqCnt = gradeSquareCounts[i];
+        var smpPct = totalPlmnCount > 0 ? (gradePlmnCounts[i] / totalPlmnCount * 100).toFixed(1) : "0.0";
+        legendHtml += '<div class="legend-item">' +
+          '<span class="legend-dot" style="background:' + g.color + '"></span>' +
+          '<span class="legend-label">' + g.label + '(' + g.range + ')</span>' +
+          '<span class="legend-count">' + sqCnt + '格</span>' +
+          '<span class="legend-pct">' + smpPct + '%</span>' +
+        '</div>';
+      }}
+      legendEl.innerHTML = legendHtml;
+      return;
+    }}
 
     var totalGridCount = 0;
     var totalPlmnCount = 0;
@@ -1280,7 +1531,7 @@ def build_map_html(sectors_json):
       var s = dataMap[name];
       var div = document.createElement("div");
       div.className = "sel-item";
-      div.innerHTML = "<span>" + s.station_name + " | GNBID:" + (s.gnbid || "") + " CI:" + (s.ci || "") + " | 频点:" + (s.freq || "") + " | PCI:" + (s.pci || "--") + " | 挂高:" + (s.height || "--") + "m</span>" +
+      div.innerHTML = "<span>" + s.station_name + " | GNBID:" + (s.gnbid || "") + " CI:" + (s.ci || "") + " | 频点:" + (s.freq || "") + " | 方位角:" + (s.azimuth != null ? s.azimuth : "--") + "° | PCI:" + (s.pci || "--") + " | 挂高:" + (s.height || "--") + "m</span>" +
         '<button data-idx="' + i + '">&times;</button>';
       div.querySelector("button").onclick = function() {{ toggleSelect(name); }};
       list.appendChild(div);
@@ -1378,6 +1629,7 @@ def build_map_html(sectors_json):
       document.getElementById("btn-scatter").classList.add("active");
       document.getElementById("btn-grid").classList.remove("active");
       document.getElementById("scatter-controls").style.display = "block";
+      document.getElementById("grid-controls").style.display = "none";
       selected.forEach(function(name) {{
         if (!scatterByCell[name] || scatterByCell[name].loading) {{
           loadScatter(name, currentMetric);
@@ -1389,9 +1641,13 @@ def build_map_html(sectors_json):
     document.getElementById("btn-grid").onclick = function() {{
       if (viewMode === "grid") return;
       viewMode = "grid";
+      gridMode = "cell";
       document.getElementById("btn-grid").classList.add("active");
       document.getElementById("btn-scatter").classList.remove("active");
       document.getElementById("scatter-controls").style.display = "none";
+      document.getElementById("grid-controls").style.display = "block";
+      document.getElementById("btn-cell-pct").classList.add("active");
+      document.getElementById("btn-weak-pct").classList.remove("active");
       selected.forEach(function(name) {{
         if (!gridByCell[name] || gridByCell[name].loading) {{
           loadGrid(name);
@@ -1406,6 +1662,7 @@ def build_map_html(sectors_json):
       document.getElementById("btn-rsrp").classList.add("active");
       document.getElementById("btn-sinr").classList.remove("active");
       document.getElementById("btn-beam").classList.remove("active");
+      document.getElementById("btn-coverage").classList.remove("active");
       reloadAllScatter();
     }};
     document.getElementById("btn-sinr").onclick = function() {{
@@ -1414,6 +1671,7 @@ def build_map_html(sectors_json):
       document.getElementById("btn-sinr").classList.add("active");
       document.getElementById("btn-rsrp").classList.remove("active");
       document.getElementById("btn-beam").classList.remove("active");
+      document.getElementById("btn-coverage").classList.remove("active");
       reloadAllScatter();
     }};
     document.getElementById("btn-beam").onclick = function() {{
@@ -1422,6 +1680,16 @@ def build_map_html(sectors_json):
       document.getElementById("btn-beam").classList.add("active");
       document.getElementById("btn-rsrp").classList.remove("active");
       document.getElementById("btn-sinr").classList.remove("active");
+      document.getElementById("btn-coverage").classList.remove("active");
+      reloadAllScatter();
+    }};
+    document.getElementById("btn-coverage").onclick = function() {{
+      if (currentMetric === "coverage") return;
+      currentMetric = "coverage";
+      document.getElementById("btn-coverage").classList.add("active");
+      document.getElementById("btn-rsrp").classList.remove("active");
+      document.getElementById("btn-sinr").classList.remove("active");
+      document.getElementById("btn-beam").classList.remove("active");
       reloadAllScatter();
     }};
     document.getElementById("indoor-select").onchange = function() {{
@@ -1432,6 +1700,22 @@ def build_map_html(sectors_json):
           reloadAllGrid();
         }}
       }}
+    }};
+    document.getElementById("btn-cell-pct").onclick = function() {{
+      if (gridMode === "cell") return;
+      gridMode = "cell";
+      document.getElementById("btn-cell-pct").classList.add("active");
+      document.getElementById("btn-weak-pct").classList.remove("active");
+      updateGridColors();
+      renderStats();
+    }};
+    document.getElementById("btn-weak-pct").onclick = function() {{
+      if (gridMode === "weak") return;
+      gridMode = "weak";
+      document.getElementById("btn-weak-pct").classList.add("active");
+      document.getElementById("btn-cell-pct").classList.remove("active");
+      updateGridColors();
+      renderStats();
     }};
   }}
 </script>
