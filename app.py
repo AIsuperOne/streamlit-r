@@ -1,6 +1,7 @@
+import csv
 import json
 import math
-import random
+import os
 import sqlite3
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
@@ -20,7 +21,9 @@ API_PORT = 8503
 AMAP_KEY = "99934c3e39ece2d89f8211c83db7d0e3"
 AMAP_SECURITY_CODE = "8a2ed5853e1c71ed20e8cd98ef24d726"
 
-COLOR_MAP = {"700M": "#FFD700", "700MHz": "#FFD700"}
+OUTPUT_DIR = os.path.join(BASE_DIR, "output")
+
+COLOR_MAP = {"700M": "#FFD700", "700MHz": "#FFD700", "2.6G": "#1E90FF", "2.6GHz": "#1E90FF", "4.9G": "#FF6B6B"}
 
 RSRP_GRADES = [
     {"label": "优", "range": "≥-95", "color": "#2ECC71", "cond": ">= -95"},
@@ -37,10 +40,10 @@ SINR_GRADES = [
 ]
 
 PCT_GRADES = [
-    {"label": "低覆盖", "range": "0~20%", "color": "#E74C3C"},
-    {"label": "中覆盖", "range": "20~50%", "color": "#F1C40F"},
-    {"label": "中高覆盖", "range": "50~80%", "color": "#3498DB"},
-    {"label": "高覆盖", "range": "80~100%", "color": "#2ECC71"},
+    {"label": "非主服区", "range": "0~20%", "color": "#E74C3C"},
+    {"label": "弱主服区", "range": "20~50%", "color": "#F1C40F"},
+    {"label": "竞争区", "range": "50~80%", "color": "#3498DB"},
+    {"label": "主控区", "range": "80~100%", "color": "#2ECC71"},
 ]
 
 COVERAGE_GRADES = [
@@ -59,98 +62,6 @@ WEAK_GRADES = [
 # ============================================================
 # 算法层：纯函数，无副作用，不访问数据库
 # ============================================================
-
-def meters_to_degrees(meters, avg_lat):
-    """【坐标转换】米→经纬度偏移量
-    实现：经度修正cos(lat)，1°≈111320m(经度方向)/110540m(纬度方向)
-    输入：meters(米), avg_lat(参考纬度)
-    输出：(lng_offset, lat_offset)
-    """
-    lng_offset = meters / 111320.0 / math.cos(avg_lat * math.pi / 180.0)
-    lat_offset = meters / 110540.0
-    return lng_offset, lat_offset
-
-
-def calc_grid_origin(cell_pts, cell_lng, cell_lat, gnbid, ci):
-    """【栅格原点】确定栅格坐标系的随机原点
-    实现：random.seed(gnbid_ci)保证同一小区生成确定性原点，
-         随机选一个采样点作为参考点，偏移半格使参考点位于栅格中央
-    输入：cell_pts[(lng,lat),...], cell_lng, cell_lat, gnbid, ci
-    输出：(origin_lng, origin_lat)
-    """
-    random.seed(f"{gnbid}_{ci}")
-    ref_idx = random.randint(0, len(cell_pts) - 1)
-    origin_lng = cell_pts[ref_idx][0] - cell_lng / 2
-    origin_lat = cell_pts[ref_idx][1] - cell_lat / 2
-    return origin_lng, origin_lat
-
-
-def bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat):
-    """【数学落格】将采样点坐标映射到栅格索引
-    实现：math.floor((coord-origin)/cell_size)
-         用floor不用int：int(-8.9)=-8截断向零错误，floor(-8.9)=-9向负无穷正确
-    输入：lng, lat, origin_lng, origin_lat, cell_lng, cell_lat
-    输出：(gx, gy) 栅格索引
-    """
-    gx = math.floor((lng - origin_lng) / cell_lng)
-    gy = math.floor((lat - origin_lat) / cell_lat)
-    return gx, gy
-
-
-def build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat):
-    """【栅格构建】将小区采样点落格并构建Shapely Polygon列表
-    实现：1.对每个采样点执行数学落格，统计每个格子的cell_count
-         2.对每个非空格子计算sw/ne坐标，构建Shapely Polygon
-    输入：cell_pts[(lng,lat),...], origin_lng, origin_lat, cell_lng, cell_lat
-    输出：[{gx, gy, polygon, cell_count, plmn_count}, ...]
-    """
-    cell_grid = {}
-    for lng, lat in cell_pts:
-        gx, gy = bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat)
-        cell_grid[(gx, gy)] = cell_grid.get((gx, gy), 0) + 1
-
-    polygons = []
-    for (gx, gy), count in cell_grid.items():
-        sw_lng = origin_lng + gx * cell_lng
-        sw_lat = origin_lat + gy * cell_lat
-        ne_lng = origin_lng + (gx + 1) * cell_lng
-        ne_lat = origin_lat + (gy + 1) * cell_lat
-        poly = Polygon([(sw_lng, sw_lat), (ne_lng, sw_lat), (ne_lng, ne_lat), (sw_lng, ne_lat)])
-        polygons.append({"gx": gx, "gy": gy, "polygon": poly, "cell_count": count, "plmn_count": 0, "weak_count": 0})
-    return polygons
-
-
-def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng, cell_lat):
-    """【PLMN统计】用Shapely covers()判定PLMN采样点落入栅格
-    实现：先数学落格快速定位候选栅格(gx,gy)，再Shapely covers()精确判定
-         两步过滤：数学落格O(1)定位→covers()精确排除边界点
-         同时统计弱覆盖点(rsrp<-105或sinr<-3)
-    输入：plmn_rows[(lng,lat,rsrp,sinr),...], polygons, origin_lng, origin_lat, cell_lng, cell_lat
-    输出：无返回，直接修改polygons[i]["plmn_count"]和polygons[i]["weak_count"]
-    """
-    poly_map = {(p["gx"], p["gy"]): p for p in polygons}
-    for r in plmn_rows:
-        if r[0] is None or r[1] is None:
-            continue
-        lng, lat = r[0], r[1]
-        pt = Point(lng, lat)
-        gx, gy = bin_point_to_grid(lng, lat, origin_lng, origin_lat, cell_lng, cell_lat)
-        key = (gx, gy)
-        if key in poly_map and poly_map[key]["polygon"].covers(pt):
-            poly_map[key]["plmn_count"] += 1
-            rsrp, sinr = r[2], r[3]
-            if rsrp is not None and sinr is not None and (rsrp < -105 or sinr < -3):
-                poly_map[key]["weak_count"] += 1
-
-
-def calc_coverage(cell_count, plmn_count):
-    """【覆盖率计算】cell_count / plmn_count × 100
-    实现：plmn_count=0时返回0，避免除零
-    输入：cell_count(小区采样点数), plmn_count(总采样点数)
-    输出：int 覆盖率百分比
-    """
-    return round(cell_count / plmn_count * 100) if plmn_count > 0 else 0
-
 
 def reconstruct_polygon(origin_lng, origin_lat, cell_lng, cell_lat, gx, gy):
     """【栅格重建】从grid_params重建Shapely Polygon，避免经纬度精度丢失
@@ -221,78 +132,6 @@ def build_where(indoor, freq=None, with_cell=False, with_plmn=False,
 # ============================================================
 # 数据层：数据库访问函数
 # ============================================================
-
-def query_cell_freq(gnbid, ci):
-    """查询5GBaseStation小区频点
-    输入：gnbid, ci
-    输出：str 频点值，不存在则返回空串
-    """
-    conn = sqlite3.connect(DB_PATH)
-    try:
-        row = conn.execute(
-            'SELECT "频点" FROM "5GBaseStation" WHERE "Gnbid"=? AND "Cellid"=? LIMIT 1',
-            [gnbid, ci],
-        ).fetchone()
-        return str(row[0]) if row and row[0] else ""
-    finally:
-        conn.close()
-
-
-def query_cell_points(gnbid, ci, indoor, freq, conn=None):
-    """查询小区采样点(经纬度)
-    输入：gnbid, ci, indoor, freq, conn(可选，外部连接)
-    输出：[(lng, lat), ...] 采样点坐标列表
-    """
-    where, params = build_where(indoor, freq=freq, with_cell=True, with_plmn=True,
-                                with_signal=True, with_coords=True)
-    params = [gnbid, ci] + params
-    own_conn = conn is None
-    if own_conn:
-        conn = sqlite3.connect(DB_PATH)
-    try:
-        rows = conn.execute(f'SELECT lng, lat FROM "data" WHERE {where}', params).fetchall()
-    finally:
-        if own_conn:
-            conn.close()
-    return [(r[0], r[1]) for r in rows if r[0] is not None and r[1] is not None]
-
-
-def query_plmn_points_with_stats(indoor, freq, bounds, conn=None):
-    """查询PLMN采样点+统计(总数/RSRP均值)
-    输入：indoor, freq, bounds(sw_lng, ne_lng, sw_lat, ne_lat), conn(可选，外部连接)
-    输出：(plmn_rows, total_count, total_avg_rsrp)
-    优化：用覆盖索引(plmn,nr_earfcn,lng,lat,rsrp)直接取lng/lat/rsrp，Python端统计
-          sinr不在覆盖索引中需回表，用于弱覆盖计算
-    """
-    where, params = build_where(indoor, freq=freq, with_plmn=True,
-                                with_coords=True, with_bounds=True)
-    params = params + list(bounds)
-
-    own_conn = conn is None
-    if own_conn:
-        conn = sqlite3.connect(DB_PATH)
-    try:
-        rows = conn.execute(
-            f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where}', params
-        ).fetchall()
-    finally:
-        if own_conn:
-            conn.close()
-
-    plmn_rows = []
-    rsrp_sum = 0.0
-    rsrp_count = 0
-    for r in rows:
-        if r[0] is None or r[1] is None:
-            continue
-        plmn_rows.append((r[0], r[1], r[2], r[3]))
-        if r[2] is not None:
-            rsrp_sum += r[2]
-            rsrp_count += 1
-    total_count = len(plmn_rows)
-    total_avg = round(rsrp_sum / rsrp_count, 2) if rsrp_count > 0 else None
-    return plmn_rows, total_count, total_avg
-
 
 def query_measurements(gnbid, ci, metric, indoor):
     """查询散点测量数据(点列表+统计+等级)
@@ -468,7 +307,7 @@ def query_optimal_azimuth(gnbid, ci, indoor):
          4.用区间覆盖法O(N)计算每个5°角度的波束内点数
          5.点数最多的角度为最优方位角
     输入：gnbid, ci, indoor(0=全部,1=室内,2=室外)
-    输出：{optimal_azimuth, optimal_ratio, current_azimuth, current_ratio, total_count}
+    输出：{optimal_azimuth, optimal_ratio, current_azimuth, total_count}
     """
     conn = sqlite3.connect(DB_PATH)
     try:
@@ -478,7 +317,7 @@ def query_optimal_azimuth(gnbid, ci, indoor):
         ).fetchone()
         if not row or not row[0] or not row[1] or row[2] is None:
             return {"optimal_azimuth": None, "optimal_ratio": None,
-                    "current_azimuth": None, "current_ratio": None, "total_count": 0}
+                    "current_azimuth": None, "total_count": 0}
         cell_lng, cell_lat, current_azimuth = float(row[0]), float(row[1]), float(row[2])
 
         where = 'gnbid=? AND ci=? AND lng IS NOT NULL'
@@ -496,9 +335,9 @@ def query_optimal_azimuth(gnbid, ci, indoor):
 
     if not bearings:
         return {"optimal_azimuth": None, "optimal_ratio": None,
-                "current_azimuth": current_azimuth, "current_ratio": None, "total_count": 0}
+                "current_azimuth": current_azimuth, "total_count": 0}
 
-    half_beam_steps = int(BEAM_WIDTH / 2 / 5)  # 30°/5 = 6
+    half_beam_steps = 12  # ±60°/5 = 12, 120°波束宽度
     angle_counts = [0] * 72
     for b in bearings:
         center = int(round(b / 5)) % 72
@@ -509,14 +348,10 @@ def query_optimal_azimuth(gnbid, ci, indoor):
     best_angle = best_idx * 5
     best_count = angle_counts[best_idx]
 
-    current_center = int(round(current_azimuth / 5)) % 72
-    current_count = angle_counts[current_center]
-
     return {
         "optimal_azimuth": best_angle,
         "optimal_ratio": round(best_count / len(bearings) * 100, 1),
         "current_azimuth": current_azimuth,
-        "current_ratio": round(current_count / len(bearings) * 100, 1),
         "total_count": len(bearings),
     }
 
@@ -536,6 +371,122 @@ def load_base_stations():
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
+
+
+def export_cell_csv(gnbid, ci, indoor, squares):
+    """【CSV导出】导出单个小区的散点和栅格数据到output/目录
+    输入：gnbid, ci, indoor, squares(栅格分析结果)
+    输出：无返回，写入文件
+    """
+    conn = sqlite3.connect(DB_PATH)
+    try:
+        where = 'gnbid=? AND ci=? AND lng IS NOT NULL AND rsrp IS NOT NULL AND sinr IS NOT NULL'
+        params = [gnbid, ci]
+        if indoor == "1":
+            where += ' AND in_out_door="In_Door"'
+        elif indoor == "2":
+            where += ' AND in_out_door="Out_Door"'
+        rows = conn.execute(f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where}', params).fetchall()
+    finally:
+        conn.close()
+
+    scatter_path = os.path.join(OUTPUT_DIR, f"scatter_{gnbid}_{ci}.csv")
+    with open(scatter_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["lng", "lat", "rsrp", "sinr", "covered"])
+        for r in rows:
+            covered = 1 if (r[2] > -105 and r[3] > -3) else 0
+            writer.writerow([r[0], r[1], r[2], r[3], covered])
+
+    grid_path = os.path.join(OUTPUT_DIR, f"grid_{gnbid}_{ci}.csv")
+    with open(grid_path, "w", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["gx", "gy", "cell_count", "plmn_count", "coverage_pct", "weak_count", "weak_pct"])
+        for sq in squares:
+            writer.writerow([sq.gx, sq.gy, sq.count, sq.plmn_count, sq.pct, sq.weak_count, sq.weak_pct])
+
+
+def prepare_eval_data(cells, indoor):
+    """【评估准备】清空output目录并为所有选中小区生成CSV数据
+    输入：cells=[(gnbid,ci),...], indoor
+    输出：{"success": True, "files": [...]} 或 {"success": False, "error": "..."}
+    """
+    # 检查频点基准数据是否存在
+    baseline_path = os.path.join(OUTPUT_DIR, f"freq_baseline_indoor{indoor}.json")
+    if not os.path.exists(baseline_path):
+        return {"success": False, "error": f"频点基准数据不存在，请先运行 python3 -m agent.precompute_baseline 生成"}
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    for f in os.listdir(OUTPUT_DIR):
+        if not f.startswith("freq_baseline_"):
+            os.remove(os.path.join(OUTPUT_DIR, f))
+
+    # 清除缓存，强制重新加载
+    from agent.analysis import _freq_baseline_cache, _analysis_cache, _build_grid_squares
+    _freq_baseline_cache.pop(indoor, None)
+    _analysis_cache.clear()
+
+    files = []
+    for gnbid, ci in cells:
+        squares, _ = _build_grid_squares(gnbid, ci, indoor, None, None)
+        export_cell_csv(gnbid, ci, indoor, squares)
+        files.append(f"scatter_{gnbid}_{ci}.csv")
+        files.append(f"grid_{gnbid}_{ci}.csv")
+
+    return {"success": True, "files": files}
+
+
+_eval_agent = None
+
+
+def _get_eval_agent():
+    global _eval_agent
+    if _eval_agent is None:
+        from agent import CellEvalAgent
+        _eval_agent = CellEvalAgent()
+    return _eval_agent
+
+
+def evaluate_cell(gnbid, ci, indoor):
+    """【小区评估】从5个维度评估小区，调用智能体生成分析
+    输入：gnbid, ci, indoor(0/1/2)
+    输出：评估结果dict
+    """
+    from agent.analysis import analyze_cell
+    a = analyze_cell(gnbid, ci, indoor)
+
+    # 调用数据分析智能体
+    try:
+        agent = _get_eval_agent()
+        ai_analysis = agent.evaluate(gnbid, ci, indoor)
+    except Exception as e:
+        ai_analysis = f"AI分析失败：{e}"
+
+    return {
+        "cell_name": a.cell_name,
+        "traffic_ratio": a.traffic_ratio,
+        "traffic_pass": a.traffic_pass,
+        "freq_avg_samples": a.freq_avg_samples,
+        "cell_samples": a.sample_count,
+        "area_ratio": a.area_ratio,
+        "area_pass": a.area_pass,
+        "cell_grid_area": a.grid_area_sqm,
+        "freq_avg_area": a.freq_avg_grids * 25,
+        "beam_inner_ratio": a.beam_inner_ratio,
+        "scatter_optimal_azimuth": a.scatter_optimal_azimuth,
+        "scatter_optimal_ratio": a.scatter_optimal_ratio,
+        "beam_pass": a.beam_pass,
+        "grid_weighted_optimal_azimuth": a.grid_weighted_optimal_azimuth,
+        "optimal_beam_coverage_rate": a.optimal_beam_coverage_rate or 0,
+        "beam_coverage_optimal": a.beam_coverage_optimal or 0,
+        "overlap_pass": a.overlap_pass,
+        "coverage_rate": a.coverage_rate or 0,
+        "excellence_rate": a.excellence_rate,
+        "coverage_pass": a.coverage_pass,
+        "excellence_pass": a.excellence_pass,
+        "overall_pass": a.overall_pass,
+        "ai_analysis": ai_analysis,
+    }
 
 
 # ============================================================
@@ -578,6 +529,15 @@ class MeasureAPI(BaseHTTPRequestHandler):
             self._handle_optimal_azimuth(gnbid, ci, indoor)
             return
 
+        if path == "/api/prepare_eval":
+            cells_param = params.get("cells", [""])[0]
+            self._handle_prepare_eval(cells_param, indoor)
+            return
+
+        if path == "/api/evaluate_cell":
+            self._handle_evaluate_cell(gnbid, ci, indoor)
+            return
+
         self._handle_measurements(gnbid, ci, params, indoor)
 
     def _handle_measurements(self, gnbid, ci, params, indoor):
@@ -586,50 +546,30 @@ class MeasureAPI(BaseHTTPRequestHandler):
         self._send_json(result)
 
     def _handle_grid_analysis(self, gnbid, ci, indoor):
-        # 1.查询小区频点
-        freq = query_cell_freq(gnbid, ci)
+        from agent.analysis import compute_grid_data
+        squares, grid_params, total_count, total_avg_rsrp, grid_count, beam_current, beam_optimal, beam_optimal_az, optimal_beam_coverage_rate = compute_grid_data(gnbid, ci, indoor)
 
-        # 2.查询小区采样点 + 4.查询PLMN采样点（共享DB连接）
-        conn = sqlite3.connect(DB_PATH)
-        try:
-            cell_pts = query_cell_points(gnbid, ci, indoor, freq, conn=conn)
-            if not cell_pts:
-                self._send_json({"squares": [], "grid_params": None, "total_count": 0, "total_avg_rsrp": None, "grid_count": 0})
-                return
+        if not squares:
+            self._send_json({"squares": [], "grid_params": None, "total_count": 0, "total_avg_rsrp": None, "grid_count": 0})
+            return
 
-            # 3.构建栅格（算法：坐标转换→原点计算→落格→Polygon构建）
-            avg_lat = sum(p[1] for p in cell_pts) / len(cell_pts)
-            cell_lng, cell_lat = meters_to_degrees(5.0, avg_lat)
-            origin_lng, origin_lat = calc_grid_origin(cell_pts, cell_lng, cell_lat, gnbid, ci)
-            polygons = build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat)
-
-            # 4.查询PLMN采样点+统计（算法：Shapely covers()包含判定）
-            all_bounds = [p["polygon"].bounds for p in polygons]
-            bounds = (min(b[0] for b in all_bounds), max(b[2] for b in all_bounds),
-                      min(b[1] for b in all_bounds), max(b[3] for b in all_bounds))
-            plmn_rows, total_count, total_avg = query_plmn_points_with_stats(indoor, freq, bounds, conn=conn)
-        finally:
-            conn.close()
-        count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng, cell_lat)
-
-        # 5.计算覆盖率并构建结果（算法：cell_count/plmn_count）
-        squares = []
-        for p in polygons:
-            pct = calc_coverage(p["cell_count"], p["plmn_count"])
-            weak_pct = round(p["weak_count"] / p["plmn_count"] * 100) if p["plmn_count"] > 0 else 0
-            bounds = p["polygon"].bounds
-            squares.append({
-                "sw_lng": bounds[0], "sw_lat": bounds[1], "ne_lng": bounds[2], "ne_lat": bounds[3],
-                "gx": p["gx"], "gy": p["gy"],
-                "count": p["cell_count"], "plmn_count": p["plmn_count"], "pct": pct,
-                "weak_count": p["weak_count"], "weak_pct": weak_pct,
+        result_squares = []
+        for sq in squares:
+            result_squares.append({
+                "sw_lng": sq.sw_lng, "sw_lat": sq.sw_lat, "ne_lng": sq.ne_lng, "ne_lat": sq.ne_lat,
+                "gx": sq.gx, "gy": sq.gy,
+                "count": sq.count, "plmn_count": sq.plmn_count, "pct": sq.pct,
+                "weak_count": sq.weak_count, "weak_pct": sq.weak_pct,
             })
 
         self._send_json({
-            "squares": squares,
-            "grid_params": {"origin_lng": origin_lng, "origin_lat": origin_lat,
-                            "cell_lng": cell_lng, "cell_lat": cell_lat, "freq": freq},
-            "total_count": total_count, "total_avg_rsrp": total_avg, "grid_count": len(squares),
+            "squares": result_squares,
+            "grid_params": grid_params,
+            "total_count": total_count, "total_avg_rsrp": total_avg_rsrp, "grid_count": grid_count,
+            "beam_coverage_current": beam_current,
+            "beam_coverage_optimal": beam_optimal,
+            "beam_coverage_optimal_azimuth": beam_optimal_az,
+            "optimal_beam_coverage_rate": optimal_beam_coverage_rate,
         })
 
     def _handle_grid_cell_detail(self, origin_lng, origin_lat, cell_lng, cell_lat, gx, gy, indoor, freq):
@@ -644,6 +584,19 @@ class MeasureAPI(BaseHTTPRequestHandler):
 
     def _handle_optimal_azimuth(self, gnbid, ci, indoor):
         result = query_optimal_azimuth(gnbid, ci, indoor)
+        self._send_json(result)
+
+    def _handle_prepare_eval(self, cells_param, indoor):
+        cells = []
+        for pair in cells_param.split(","):
+            parts = pair.split(":")
+            if len(parts) == 2:
+                cells.append((parts[0], parts[1]))
+        result = prepare_eval_data(cells, indoor)
+        self._send_json(result)
+
+    def _handle_evaluate_cell(self, gnbid, ci, indoor):
+        result = evaluate_cell(gnbid, ci, indoor)
         self._send_json(result)
 
     def _send_json(self, result):
@@ -721,6 +674,55 @@ def build_map_html(sectors_json):
     margin-top: 6px; padding: 4px 10px; border: 1px solid #ccc; border-radius: 4px;
     background: #f5f5f5; cursor: pointer; font-size: 12px;
   }}
+  #eval-btn {{
+    margin-top: 6px; padding: 6px 12px; border: 1px solid #9B59B6; border-radius: 4px;
+    background: #9B59B6; color: #fff; cursor: pointer; font-size: 12px; width: 100%;
+  }}
+  #eval-btn:hover {{ background: #8E44AD; }}
+  #eval-btn:disabled {{ background: #ccc; border-color: #ccc; cursor: not-allowed; }}
+  #eval-result {{
+    margin-top: 8px; max-height: 500px; overflow-y: auto;
+  }}
+  .eval-card {{
+    border: 1px solid #ddd; border-radius: 6px; padding: 0; margin-bottom: 10px;
+    font-size: 12px; line-height: 1.3; overflow: hidden;
+  }}
+  .eval-header {{
+    display: flex; justify-content: space-between; align-items: center;
+    padding: 5px 10px; border-bottom: 1px solid #eee;
+  }}
+  .eval-header .cell-name {{ font-weight: bold; font-size: 12px; }}
+  .eval-badge {{
+    padding: 1px 6px; border-radius: 3px; font-size: 11px; font-weight: bold;
+  }}
+  .eval-badge.pass {{ background: #2ECC71; color: #fff; }}
+  .eval-badge.fail {{ background: #E74C3C; color: #fff; }}
+  .eval-table {{ width: 100%; border-collapse: collapse; }}
+  .eval-table td {{ padding: 2px 6px; border-bottom: 1px solid #f0f0f0; }}
+  .eval-table tr.fail-row {{ background: #FFF5F5; }}
+  .eval-table .dim {{ color: #555; white-space: nowrap; font-size: 11px; min-width: 60px; }}
+  .eval-table .value {{ font-family: monospace; font-size: 11px; }}
+  .eval-table .threshold {{ color: #999; font-size: 10px; white-space: nowrap; }}
+  .eval-table .result {{ font-weight: bold; text-align: center; width: 22px; }}
+  .eval-table .result.pass {{ color: #2ECC71; }}
+  .eval-table .result.fail {{ color: #E74C3C; }}
+  .eval-layer {{
+    padding: 1px 6px; font-size: 10px; font-weight: bold; color: #fff;
+    background: #95a5a6;
+  }}
+  .eval-layer.scale {{ background: #3498db; }}
+  .eval-layer.structure {{ background: #e67e22; }}
+  .eval-layer.quality {{ background: #27ae60; }}
+  .eval-footer {{
+    padding: 4px 10px; background: #fafafa; border-top: 1px solid #eee;
+  }}
+  .eval-footer .label {{ font-weight: bold; color: #555; margin-right: 4px; }}
+  .eval-footer .weakness {{ color: #c0392b; margin-bottom: 2px; }}
+  .eval-footer .suggestion {{ color: #2980b9; }}
+  .eval-ai {{
+    margin-top: 4px; padding: 6px 10px; background: #f8f9fa;
+    border-top: 1px solid #eee; font-size: 11px; color: #444;
+  }}
   #indoor-select {{
     padding: 3px 6px; border: 1px solid #ccc; border-radius: 4px; font-size: 12px;
     margin-bottom: 6px;
@@ -760,12 +762,20 @@ def build_map_html(sectors_json):
     <label><input type="radio" name="radius" value="custom">自定义</label>
   </div>
   <input id="custom-radius" type="number" min="1" max="5000" placeholder="输入米数">
+  <h4>频段筛选</h4>
+  <div class="metric-toggle">
+    <button class="active" id="btn-700m">700M</button>
+    <button class="active" id="btn-26g">2.6G</button>
+    <button class="active" id="btn-49g">4.9G</button>
+  </div>
   <h4>小区搜索</h4>
   <input id="search" type="text" placeholder="输入小区中文名关键字...">
   <div id="search-results"></div>
   <div id="sel-header" style="display:none;"><h4>已选中 (<span id="sel-count">0</span>)</h4></div>
   <div id="sel-list"></div>
   <button id="clear-btn" style="display:none;">全部清除</button>
+  <button id="eval-btn" style="display:none;">AI评估</button>
+  <div id="eval-result"></div>
 
   <div id="measure-section">
     <h4>测量数据</h4>
@@ -785,6 +795,7 @@ def build_map_html(sectors_json):
     <div class="metric-toggle">
       <button class="active" id="btn-cell-pct">小区占比</button>
       <button id="btn-weak-pct">覆盖比例</button>
+      <button id="btn-beam-pct">波束覆盖</button>
     </div>
     </div>
     <select id="indoor-select">
@@ -827,6 +838,38 @@ def build_map_html(sectors_json):
   var activeInfoWindow = null;
   var showTimer = null;
   var hideTimer = null;
+
+  var FREQ_BANDS = {{'700M': ['152650'], '2.6G': ['504990', '524910', '529230'], '4.9G': ['721824']}};
+  var bandVisible = {{'700M': true, '2.6G': true, '4.9G': true}};
+
+  function getBand(freq) {{
+    for (var band in FREQ_BANDS) {{
+      if (FREQ_BANDS[band].indexOf(freq) >= 0) return band;
+    }}
+    return null;
+  }}
+
+  function toggleBand(band) {{
+    bandVisible[band] = !bandVisible[band];
+    var btnId = band === '700M' ? 'btn-700m' : band === '2.6G' ? 'btn-26g' : 'btn-49g';
+    var btn = document.getElementById(btnId);
+    if (bandVisible[band]) {{
+      btn.classList.add('active');
+    }} else {{
+      btn.classList.remove('active');
+    }}
+    sectors.forEach(function(s) {{
+      var sBand = getBand(s.freq);
+      if (sBand === band) {{
+        if (overlays[s.cell_name]) {{
+          overlays[s.cell_name].setMap(bandVisible[band] ? map : null);
+        }}
+        if (!bandVisible[band] && selected.indexOf(s.cell_name) >= 0) {{
+          toggleSelect(s.cell_name);
+        }}
+      }}
+    }});
+  }}
 
   function startShowTimer(type, obj) {{
     clearTimeout(hideTimer);
@@ -971,9 +1014,13 @@ def build_map_html(sectors_json):
     return (Math.atan2(y, x) * 180 / Math.PI + 360) % 360;
   }}
 
+  function circularDiff(a, b) {{
+    var d = ((a - b + 180 + 360) % 360) - 180;
+    return Math.abs(d);
+  }}
+
   function isInBeam(bearing, azimuth) {{
-    var diff = ((bearing - azimuth + 180 + 360) % 360) - 180;
-    return Math.abs(diff) <= 60;
+    return circularDiff(bearing, azimuth) <= 60;
   }}
 
   function beamColor(lng, lat, s) {{
@@ -981,10 +1028,22 @@ def build_map_html(sectors_json):
     return isInBeam(b, s.azimuth) ? "#2ECC71" : "#E74C3C";
   }}
 
-  function GridPolygon(sq, gridParams) {{
+  function GridPolygon(sq, gridParams, cellName) {{
     this.sq = sq;
     this.gridParams = gridParams;
-    var color = gridMode === "weak" ? weakColor(sq.weak_pct) : pctColor(sq.pct);
+    this.cellName = cellName;
+    var color;
+    if (gridMode === "beam") {{
+      var s = dataMap[cellName];
+      var clng = (sq.sw_lng + sq.ne_lng) / 2;
+      var clat = (sq.sw_lat + sq.ne_lat) / 2;
+      var b = calcBearing(parseFloat(s.lng), parseFloat(s.lat), clng, clat);
+      color = circularDiff(b, s.azimuth) <= 60 ? "#2ECC71" : "#E74C3C";
+    }} else if (gridMode === "weak") {{
+      color = weakColor(sq.weak_pct);
+    }} else {{
+      color = pctColor(sq.pct);
+    }}
     this.polygon = new AMap.Polygon({{
       path: [
         [sq.sw_lng, sq.sw_lat],
@@ -1016,9 +1075,18 @@ def build_map_html(sectors_json):
     Object.keys(gridByCell).forEach(function(name) {{
       if (!gridByCell[name] || !gridByCell[name].gridPolygons) return;
       gridByCell[name].gridPolygons.forEach(function(gp) {{
-        var pct = gridMode === "weak" ? gp.sq.weak_pct : gp.sq.pct;
-        var colorFn = gridMode === "weak" ? weakColor : pctColor;
-        var color = colorFn(pct);
+        var color;
+        if (gridMode === "beam") {{
+          var s = dataMap[name];
+          var clng = (gp.sq.sw_lng + gp.sq.ne_lng) / 2;
+          var clat = (gp.sq.sw_lat + gp.sq.ne_lat) / 2;
+          var b = calcBearing(parseFloat(s.lng), parseFloat(s.lat), clng, clat);
+          color = circularDiff(b, s.azimuth) <= 60 ? "#2ECC71" : "#E74C3C";
+        }} else {{
+          var pct = gridMode === "weak" ? gp.sq.weak_pct : gp.sq.pct;
+          var colorFn = gridMode === "weak" ? weakColor : pctColor;
+          color = colorFn(pct);
+        }}
         gp.polygon.setOptions({{ fillColor: color, strokeColor: color }});
       }});
     }});
@@ -1034,6 +1102,7 @@ def build_map_html(sectors_json):
     setupSearch();
     setupRadius();
     setupMeasure();
+    setupBandFilter();
   }}
 
   function addSectors() {{
@@ -1153,8 +1222,7 @@ def build_map_html(sectors_json):
           beamIn: metric === "beam" ? beamIn : 0,
           beamOut: metric === "beam" ? beamOut : 0,
           optimalAzimuth: null,
-          optimalRatio: null,
-          currentRatio: null
+          optimalRatio: null
         }};
         if (metric === "beam") {{
           fetch("http://localhost:{API_PORT}/api/optimal_azimuth?gnbid=" + encodeURIComponent(s.gnbid) + "&ci=" + encodeURIComponent(s.ci) + "&indoor=" + indoor)
@@ -1164,7 +1232,6 @@ def build_map_html(sectors_json):
               if (scatterByCell[name]) {{
                 scatterByCell[name].optimalAzimuth = opt.optimal_azimuth;
                 scatterByCell[name].optimalRatio = opt.optimal_ratio;
-                scatterByCell[name].currentRatio = opt.current_ratio;
                 renderStats();
               }}
             }});
@@ -1228,7 +1295,7 @@ def build_map_html(sectors_json):
         var gridPolygons = [];
         var gridParams = result.grid_params;
         result.squares.forEach(function(sq) {{
-          var gp = new GridPolygon(sq, gridParams);
+          var gp = new GridPolygon(sq, gridParams, name);
           gp.setMap(map);
           gridPolygons.push(gp);
         }});
@@ -1237,7 +1304,11 @@ def build_map_html(sectors_json):
           total_count: result.total_count,
           total_avg_rsrp: result.total_avg_rsrp,
           grid_count: result.grid_count,
-          squares: result.squares
+          squares: result.squares,
+          beam_coverage_current: result.beam_coverage_current,
+          beam_coverage_optimal: result.beam_coverage_optimal,
+          beam_coverage_optimal_azimuth: result.beam_coverage_optimal_azimuth,
+          optimal_beam_coverage_rate: result.optimal_beam_coverage_rate
         }};
         renderStats();
       }})
@@ -1305,7 +1376,7 @@ def build_map_html(sectors_json):
 
     if (currentMetric === "beam") {{
       var totalCount = 0, totalIn = 0, totalOut = 0;
-      var bestOptimal = null, bestOptimalRatio = -1, bestCurrentRatio = null;
+      var bestOptimal = null, bestOptimalRatio = -1;
       names.forEach(function(name) {{
         var info = scatterByCell[name];
         if (info) {{
@@ -1315,7 +1386,6 @@ def build_map_html(sectors_json):
           if (info.optimalRatio != null && info.optimalRatio > bestOptimalRatio) {{
             bestOptimalRatio = info.optimalRatio;
             bestOptimal = info.optimalAzimuth;
-            bestCurrentRatio = info.currentRatio;
           }}
         }}
       }});
@@ -1324,12 +1394,9 @@ def build_map_html(sectors_json):
       var html = '<div class="stat-row"><span>采样点数</span><span class="stat-val">' + totalCount + '</span></div>';
       html += '<div class="stat-row"><span>波束内</span><span class="stat-val">' + totalIn + '</span></div>';
       html += '<div class="stat-row"><span>波束外</span><span class="stat-val">' + totalOut + '</span></div>';
-      html += '<div class="stat-row"><span>波束内占比</span><span class="stat-val">' + inPct + '%</span></div>';
+      html += '<div class="stat-row"><span>波束内占比（散点）</span><span class="stat-val">' + inPct + '%</span></div>';
       if (bestOptimal != null) {{
-        html += '<div class="stat-row" style="color:#2ECC71"><span>最优方位角</span><span class="stat-val">' + bestOptimal + '° (' + bestOptimalRatio + '%)</span></div>';
-      }}
-      if (bestCurrentRatio != null) {{
-        html += '<div class="stat-row"><span>当前方位角占比</span><span class="stat-val">' + bestCurrentRatio + '%</span></div>';
+        html += '<div class="stat-row" style="color:#2ECC71"><span>最优方位角（散点）</span><span class="stat-val">' + bestOptimal + '° (' + bestOptimalRatio + '%)</span></div>';
       }}
       statsEl.innerHTML = html;
       return;
@@ -1418,6 +1485,8 @@ def build_map_html(sectors_json):
       var totalGridCount = 0;
       var totalPlmnCount = 0;
       var totalWeakCount = 0;
+      var validGridCount = 0;
+      var excellenceCount = 0;
       var gradeSquareCounts = [0, 0, 0, 0];
       var gradePlmnCounts = [0, 0, 0, 0];
 
@@ -1427,22 +1496,27 @@ def build_map_html(sectors_json):
         totalGridCount += info.grid_count;
         if (info.squares) {{
           info.squares.forEach(function(sq) {{
+            if (sq.plmn_count === 0) return;
+            validGridCount++;
             var wp = sq.weak_pct;
             var gi = wp >= 80 ? 3 : wp >= 50 ? 2 : wp >= 20 ? 1 : 0;
             gradeSquareCounts[gi]++;
             gradePlmnCounts[gi] += sq.plmn_count;
             totalPlmnCount += sq.plmn_count;
             totalWeakCount += sq.weak_count || 0;
+            if (wp < 20) excellenceCount++;
           }});
         }}
       }});
 
       var area = totalGridCount * 25;
       var weakPct = totalPlmnCount > 0 ? (totalWeakCount / totalPlmnCount * 100).toFixed(1) : "0.0";
+      var excellenceRate = validGridCount > 0 ? (excellenceCount / validGridCount * 100).toFixed(1) : "0.0";
 
       var html = '<div class="stat-row"><span>栅格数</span><span class="stat-val">' + totalGridCount + '</span></div>';
       html += '<div class="stat-row"><span>覆盖面积</span><span class="stat-val">' + area + ' m²</span></div>';
       html += '<div class="stat-row"><span>弱覆盖占比</span><span class="stat-val">' + weakPct + '%</span></div>';
+      html += '<div class="stat-row"><span>栅格优良率</span><span class="stat-val">' + excellenceRate + '%</span></div>';
       statsEl.innerHTML = html;
 
       var legendHtml = "";
@@ -1457,6 +1531,76 @@ def build_map_html(sectors_json):
           '<span class="legend-pct">' + smpPct + '%</span>' +
         '</div>';
       }}
+      legendEl.innerHTML = legendHtml;
+      return;
+    }}
+
+    if (gridMode === "beam") {{
+      var beamTotal = 0, beamInner = 0;
+      var beamMainSum = 0, beamMainTotal = 0;
+      var optAzSum = 0, optAzCnt = 0;
+      var optBeamGridSum = 0, optMainServSum = 0;
+
+      names.forEach(function(name) {{
+        var info = gridByCell[name];
+        if (!info || info.loading || !info.squares) return;
+        var s = dataMap[name];
+        if (!s || s.azimuth == null) return;
+        var slng = parseFloat(s.lng), slat = parseFloat(s.lat);
+
+        var cellAngleWeight = new Array(72).fill(0);
+        var cellAngleGridCount = new Array(72).fill(0);
+        var cellAngleCovered = new Array(72).fill(0);
+
+        info.squares.forEach(function(sq) {{
+          var clng = (sq.sw_lng + sq.ne_lng) / 2;
+          var clat = (sq.sw_lat + sq.ne_lat) / 2;
+          var b = calcBearing(slng, slat, clng, clat);
+          beamTotal++;
+          if (circularDiff(b, s.azimuth) <= 60) {{
+            beamInner++;
+            beamMainTotal++;
+            if (sq.pct >= 50) beamMainSum++;
+          }}
+          var weight = sq.pct / 100;
+          var center = Math.round(b / 5) % 72;
+          for (var offset = -12; offset <= 12; offset++) {{
+            var idx = (center + offset + 72) % 72;
+            cellAngleWeight[idx] += weight;
+            cellAngleGridCount[idx]++;
+            if (sq.pct >= 50) cellAngleCovered[idx]++;
+          }}
+        }});
+
+        // pct加权法找最优方位角（与评估_grid_weighted_optimal_azimuth一致）
+        var bestIdx = 0, bestWeight = -1;
+        for (var i = 0; i < 72; i++) {{
+          if (cellAngleWeight[i] > bestWeight) {{ bestWeight = cellAngleWeight[i]; bestIdx = i; }}
+        }}
+        optAzSum += bestIdx * 5;
+        optAzCnt++;
+        optBeamGridSum += cellAngleGridCount[bestIdx];
+        optMainServSum += cellAngleCovered[bestIdx];
+      }});
+
+      var beamPct = beamTotal > 0 ? (beamInner / beamTotal * 100).toFixed(1) : "0.0";
+      var beamMainPct = beamMainTotal > 0 ? (beamMainSum / beamMainTotal * 100).toFixed(1) : "--";
+      var beamOuter = beamTotal - beamInner;
+      var optAzAvg = optAzCnt > 0 ? Math.round(optAzSum / optAzCnt) : "--";
+      var optBeamPct = beamTotal > 0 ? (optBeamGridSum / beamTotal * 100).toFixed(1) : "--";
+      var optMainPct = optBeamGridSum > 0 ? (optMainServSum / optBeamGridSum * 100).toFixed(1) : "--";
+
+      var html = '<div class="stat-row"><span>栅格数</span><span class="stat-val">' + beamTotal + '</span></div>';
+      html += '<div class="stat-row"><span>波束内栅格</span><span class="stat-val">' + beamInner + '</span></div>';
+      html += '<div class="stat-row"><span>波束内占比（栅格）</span><span class="stat-val">' + beamPct + '%</span></div>';
+      html += '<div class="stat-row"><span>主服波束占比（栅格）</span><span class="stat-val">' + beamMainPct + '%</span></div>';
+      html += '<div class="stat-row"><span>最优方位角（栅格）</span><span class="stat-val">' + optAzAvg + '°</span></div>';
+      html += '<div class="stat-row"><span>最优波束占比（栅格）</span><span class="stat-val">' + optBeamPct + '%</span></div>';
+      html += '<div class="stat-row"><span>最优主服波束占比（栅格）</span><span class="stat-val">' + optMainPct + '%</span></div>';
+      statsEl.innerHTML = html;
+
+      var legendHtml = '<div class="legend-item"><span class="legend-dot" style="background:#2ECC71"></span><span class="legend-label">波束内(±60°)</span><span class="legend-count">' + beamInner + '格</span></div>';
+      legendHtml += '<div class="legend-item"><span class="legend-dot" style="background:#E74C3C"></span><span class="legend-label">波束外</span><span class="legend-count">' + beamOuter + '格</span></div>';
       legendEl.innerHTML = legendHtml;
       return;
     }}
@@ -1497,7 +1641,7 @@ def build_map_html(sectors_json):
     html += '<div class="stat-row"><span>栅格数</span><span class="stat-val">' + totalGridCount + '</span></div>';
     statsEl.innerHTML = html;
 
-    var legendHtml = "";
+    var legendHtml = '<div style="font-size:11px;color:#888;margin-bottom:4px;">主服小区采样点/总采样点</div>';
     for (var i = 0; i < PCT_GRADES.length; i++) {{
       var g = PCT_GRADES[i];
       var sqCnt = gradeSquareCounts[i];
@@ -1523,9 +1667,11 @@ def build_map_html(sectors_json):
     var list = document.getElementById("sel-list");
     var count = document.getElementById("sel-count");
     var btn = document.getElementById("clear-btn");
+    var evalBtn = document.getElementById("eval-btn");
     count.textContent = selected.length;
     header.style.display = selected.length ? "block" : "none";
     btn.style.display = selected.length ? "inline-block" : "none";
+    evalBtn.style.display = selected.length ? "block" : "none";
     list.innerHTML = "";
     selected.forEach(function(name, i) {{
       var s = dataMap[name];
@@ -1561,12 +1707,20 @@ def build_map_html(sectors_json):
     renderSelList();
     updateMeasureSection();
     renderStats();
+    document.getElementById("eval-result").innerHTML = "";
   }};
 
   function rebuildSectors() {{
     for (var name in overlays) map.remove(overlays[name]);
     overlays = {{}}; dataMap = {{}};
     addSectors();
+    // 隐藏已关闭频段的扇区
+    sectors.forEach(function(s) {{
+      var sBand = getBand(s.freq);
+      if (sBand && !bandVisible[sBand] && overlays[s.cell_name]) {{
+        overlays[s.cell_name].setMap(null);
+      }}
+    }});
     selected.forEach(function(name) {{
       if (overlays[name]) overlays[name].setOptions({{ fillColor: "#00FF00", fillOpacity: 0.7, strokeWeight: 2 }});
     }});
@@ -1604,7 +1758,7 @@ def build_map_html(sectors_json):
       var q = input.value.trim();
       results.innerHTML = "";
       if (!q) return;
-      var matches = sectors.filter(function(s) {{ return s.cell_name.indexOf(q) >= 0; }}).slice(0, 10);
+      var matches = sectors.filter(function(s) {{ return s.cell_name.indexOf(q) >= 0 && bandVisible[getBand(s.freq)] !== false; }}).slice(0, 10);
       matches.forEach(function(m) {{
         var div = document.createElement("div");
         div.style.cssText = "padding:4px 6px;cursor:pointer;border-bottom:1px solid #eee;";
@@ -1648,6 +1802,7 @@ def build_map_html(sectors_json):
       document.getElementById("grid-controls").style.display = "block";
       document.getElementById("btn-cell-pct").classList.add("active");
       document.getElementById("btn-weak-pct").classList.remove("active");
+      document.getElementById("btn-beam-pct").classList.remove("active");
       selected.forEach(function(name) {{
         if (!gridByCell[name] || gridByCell[name].loading) {{
           loadGrid(name);
@@ -1706,6 +1861,7 @@ def build_map_html(sectors_json):
       gridMode = "cell";
       document.getElementById("btn-cell-pct").classList.add("active");
       document.getElementById("btn-weak-pct").classList.remove("active");
+      document.getElementById("btn-beam-pct").classList.remove("active");
       updateGridColors();
       renderStats();
     }};
@@ -1714,10 +1870,169 @@ def build_map_html(sectors_json):
       gridMode = "weak";
       document.getElementById("btn-weak-pct").classList.add("active");
       document.getElementById("btn-cell-pct").classList.remove("active");
+      document.getElementById("btn-beam-pct").classList.remove("active");
+      updateGridColors();
+      renderStats();
+    }};
+    document.getElementById("btn-beam-pct").onclick = function() {{
+      if (gridMode === "beam") return;
+      gridMode = "beam";
+      document.getElementById("btn-beam-pct").classList.add("active");
+      document.getElementById("btn-cell-pct").classList.remove("active");
+      document.getElementById("btn-weak-pct").classList.remove("active");
       updateGridColors();
       renderStats();
     }};
   }}
+
+  function setupBandFilter() {{
+    document.getElementById("btn-700m").onclick = function() {{ toggleBand('700M'); }};
+    document.getElementById("btn-26g").onclick = function() {{ toggleBand('2.6G'); }};
+    document.getElementById("btn-49g").onclick = function() {{ toggleBand('4.9G'); }};
+  }}
+
+  function renderEvalResults(results) {{
+    var el = document.getElementById("eval-result");
+    var html = "";
+    results.forEach(function(r) {{
+      var passClass = r.overall_pass ? "pass" : "fail";
+      var passText = r.overall_pass ? "合格" : "不合格";
+      var failCount = [r.traffic_pass, r.area_pass, r.beam_pass, r.overlap_pass, r.coverage_pass, r.excellence_pass].filter(function(v){{return !v;}}).length;
+
+      html += '<div class="eval-card">';
+
+      // Header
+      html += '<div class="eval-header">';
+      html += '<span class="cell-name">' + r.cell_name + '</span>';
+      html += '<span class="eval-badge ' + passClass + '">' + passText + (failCount > 0 ? '（' + failCount + '项不合格）' : '') + '</span>';
+      html += '</div>';
+
+      // Table
+      html += '<table class="eval-table">';
+
+      // Scale layer
+      html += '<tr><td colspan="4" class="eval-layer scale">规模评估</td></tr>';
+      html += makeRow('小区业务量', r.traffic_ratio + '倍(' + r.cell_samples + '/' + r.freq_avg_samples + ')', '≥1.0', r.traffic_pass);
+      html += makeRow('小区覆盖面积', r.area_ratio + '倍(' + r.cell_grid_area + '㎡/' + r.freq_avg_area + '㎡)', '≥1.0', r.area_pass);
+
+      // Structure layer
+      html += '<tr><td colspan="4" class="eval-layer structure">结构评估</td></tr>';
+      var beamVal = (r.scatter_optimal_azimuth != null && r.beam_inner_ratio != null) ? r.scatter_optimal_azimuth + '°/' + r.beam_inner_ratio + '%/' + (r.scatter_optimal_ratio != null ? r.scatter_optimal_ratio : '--') + '%' : '未知';
+      html += makeRow('正对用户', beamVal, '≥60%', r.beam_pass);
+      var overlapVal = r.grid_weighted_optimal_azimuth + '°/' + r.optimal_beam_coverage_rate + '%/' + r.beam_coverage_optimal + '%';
+      html += makeRow('正对栅格', overlapVal, '≥70%', r.overlap_pass);
+
+      // Quality layer
+      html += '<tr><td colspan="4" class="eval-layer quality">质量评估</td></tr>';
+      html += makeRow('散点覆盖率', r.coverage_rate + '%', '>95%', r.coverage_pass);
+      html += makeRow('栅格优良率', r.excellence_rate + '%', '>95%', r.excellence_pass);
+
+      html += '</table>';
+
+      // Footer with weakness and suggestion (extracted from ai_analysis)
+      if (r.ai_analysis && !r.overall_pass) {{
+        var weakness = extractSection(r.ai_analysis, '短板');
+        var suggestion = extractSection(r.ai_analysis, '建议');
+        if (weakness || suggestion) {{
+          html += '<div class="eval-footer">';
+          if (weakness) html += '<div class="weakness"><span class="label">短板：</span>' + weakness + '</div>';
+          if (suggestion) html += '<div class="suggestion"><span class="label">建议：</span>' + suggestion + '</div>';
+          html += '</div>';
+        }}
+      }}
+
+      // AI analysis (collapsed)
+      if (r.ai_analysis) {{
+        html += '<details class="eval-ai"><summary style="cursor:pointer;font-weight:bold;color:#666;">AI详细分析</summary><div style="margin-top:6px;">' + r.ai_analysis + '</div></details>';
+      }}
+
+      html += '</div>';
+    }});
+    el.innerHTML = html;
+  }}
+
+  function makeRow(dim, value, threshold, pass) {{
+    var rc = pass ? 'pass' : 'fail';
+    var rt = pass ? '✓' : '✗';
+    var rowClass = pass ? '' : ' class="fail-row"';
+    return '<tr' + rowClass + '><td class="dim">' + dim + '</td><td class="value">' + value + '</td><td class="threshold">' + threshold + '</td><td class="result ' + rc + '">' + rt + '</td></tr>';
+  }}
+
+  function extractSection(text, keyword) {{
+    var patterns = ['【' + keyword + '】', '[' + keyword + ']'];
+    for (var i = 0; i < patterns.length; i++) {{
+      var idx = text.indexOf(patterns[i]);
+      if (idx >= 0) {{
+        var start = idx + patterns[i].length;
+        var end = text.length;
+        for (var j = i + 1; j < patterns.length; j++) {{
+          var nextIdx = text.indexOf(patterns[j], start);
+          if (nextIdx >= 0 && nextIdx < end) end = nextIdx;
+        }}
+        // Also check for other section markers
+        var sectionEnd = text.indexOf('【', start);
+        if (sectionEnd >= 0 && sectionEnd < end) end = sectionEnd;
+        var sectionEnd2 = text.indexOf('\\n【', start);
+        if (sectionEnd2 >= 0 && sectionEnd2 < end) end = sectionEnd2;
+        return text.substring(start, end).trim();
+      }}
+    }}
+    return '';
+  }}
+
+  document.getElementById("eval-btn").onclick = function() {{
+    if (selected.length === 0) return;
+    var evalBtn = document.getElementById("eval-btn");
+    var resultEl = document.getElementById("eval-result");
+    evalBtn.disabled = true;
+    var indoor = document.getElementById("indoor-select").value;
+
+    // 第一步：导出数据
+    resultEl.innerHTML = '<div style="color:#888;font-size:12px;">正在导出数据...</div>';
+    var cellsParam = selected.map(function(name) {{
+      var s = dataMap[name];
+      return encodeURIComponent(s.gnbid) + ":" + encodeURIComponent(s.ci);
+    }}).join(",");
+
+    fetch("http://localhost:{API_PORT}/api/prepare_eval?cells=" + cellsParam + "&indoor=" + indoor)
+      .then(function(r) {{ return r.json(); }})
+      .then(function(prepResult) {{
+        if (!prepResult.success) {{
+          evalBtn.disabled = false;
+          resultEl.innerHTML = '<div style="color:#e00;font-size:12px;">数据导出失败</div>';
+          return;
+        }}
+        // 第二步：确认数据生成后，进行AI评估
+        resultEl.innerHTML = '<div style="color:#888;font-size:12px;">数据已导出(' + prepResult.files.length + '个文件)，正在AI评估...</div>';
+        var results = [];
+        var pending = selected.length;
+        selected.forEach(function(name) {{
+          var s = dataMap[name];
+          fetch("http://localhost:{API_PORT}/api/evaluate_cell?gnbid=" + encodeURIComponent(s.gnbid) + "&ci=" + encodeURIComponent(s.ci) + "&indoor=" + indoor)
+            .then(function(r) {{ return r.json(); }})
+            .then(function(data) {{
+              results.push(data);
+              pending--;
+              if (pending === 0) {{
+                evalBtn.disabled = false;
+                renderEvalResults(results);
+              }}
+            }})
+            .catch(function() {{
+              pending--;
+              if (pending === 0) {{
+                evalBtn.disabled = false;
+                if (results.length > 0) renderEvalResults(results);
+                else resultEl.innerHTML = '<div style="color:#e00;font-size:12px;">AI评估失败</div>';
+              }}
+            }});
+        }});
+      }})
+      .catch(function() {{
+        evalBtn.disabled = false;
+        resultEl.innerHTML = '<div style="color:#e00;font-size:12px;">数据导出失败</div>';
+      }});
+  }};
 </script>
 </body>
 </html>"""
