@@ -14,9 +14,15 @@ from .config import DB_PATH, OUTPUT_DIR
 
 def _compute_one_cell(args):
     gnbid, ci, indoor = args
+    import sqlite3
     from .analysis import _build_grid_squares
+    from .config import DB_PATH
     try:
-        squares, _ = _build_grid_squares(gnbid, ci, indoor, None, None)
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            squares, _, _ = _build_grid_squares(gnbid, ci, indoor, None, None, conn)
+        finally:
+            conn.close()
         return len(squares) if squares else 0
     except Exception:
         return 0

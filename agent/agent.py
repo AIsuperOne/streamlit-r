@@ -1,5 +1,6 @@
 import json
 import os
+import time
 
 import requests as http_requests
 
@@ -15,6 +16,9 @@ _TOOL_DISPATCH = {
     "read_csv": read_csv,
     "query_sql": execute_query,
 }
+
+_API_TIMEOUT = 180
+_MAX_RETRIES = 2
 
 
 class CellEvalAgent:
@@ -56,14 +60,22 @@ class CellEvalAgent:
         return "分析超时，未能完成评估"
 
     def _call_glm(self, messages):
-        resp = http_requests.post(
-            ZHIPU_API_URL,
-            headers={"Authorization": f"Bearer {ZHIPU_API_KEY}", "Content-Type": "application/json"},
-            json={"model": MODEL, "messages": messages, "tools": self.tools, "tool_choice": "auto"},
-            timeout=60,
-        )
-        resp.raise_for_status()
-        return resp.json()
+        last_err = None
+        for attempt in range(_MAX_RETRIES):
+            try:
+                resp = http_requests.post(
+                    ZHIPU_API_URL,
+                    headers={"Authorization": f"Bearer {ZHIPU_API_KEY}", "Content-Type": "application/json"},
+                    json={"model": MODEL, "messages": messages, "tools": self.tools, "tool_choice": "auto"},
+                    timeout=_API_TIMEOUT,
+                )
+                resp.raise_for_status()
+                return resp.json()
+            except (http_requests.exceptions.Timeout, http_requests.exceptions.ConnectionError) as e:
+                last_err = e
+                if attempt < _MAX_RETRIES - 1:
+                    time.sleep(2 * (attempt + 1))
+        raise last_err
 
     @staticmethod
     def _execute_tool(name, args):

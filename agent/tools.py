@@ -3,7 +3,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "query_cell_analysis",
-            "description": "查询小区完整6维评估数据：业务量、覆盖面积、覆盖最优性、重叠覆盖、散点覆盖率、栅格优良率，返回全部指标和判定结果，包含散点统计、栅格统计和波束分析数据",
+            "description": "查询小区完整评估数据：7维评估(业务水平/面积水平/正对用户/正对栅格/主服覆盖/散点覆盖率/栅格优良率) + 5项射频专项(覆盖不足/越区覆盖/背向覆盖/精准覆盖/重叠覆盖)，返回层次化结构数据，包含scale/structure/quality/rf/stats五个分组",
             "parameters": {
                 "type": "object",
                 "properties": {
