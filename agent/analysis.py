@@ -86,6 +86,8 @@ def _build_grid_squares(gnbid, ci, indoor, cell_lng_coord, cell_lat_coord, conn)
     for p in polygons:
         pct = round(p["cell_count"] / p["plmn_count"] * 100) if p["plmn_count"] > 0 else 0
         weak_pct = round(p["weak_count"] / p["plmn_count"] * 100) if p["plmn_count"] > 0 else 0
+        avg_rsrp = round(p["rsrp_sum"] / p["rsrp_count"], 2) if p["rsrp_count"] > 0 else None
+        avg_sinr = round(p["sinr_sum"] / p["sinr_count"], 2) if p["sinr_count"] > 0 else None
         center_lng = origin_lng + (p["gx"] + 0.5) * cell_lng
         center_lat = origin_lat + (p["gy"] + 0.5) * cell_lat
         bnd = p["bounds"]
@@ -98,7 +100,7 @@ def _build_grid_squares(gnbid, ci, indoor, cell_lng_coord, cell_lat_coord, conn)
             weak_count=p["weak_count"], weak_pct=weak_pct,
             center_lng=center_lng, center_lat=center_lat,
             sw_lng=bnd[0], sw_lat=bnd[1], ne_lng=bnd[2], ne_lat=bnd[3],
-            bearing=bearing,
+            bearing=bearing, avg_rsrp=avg_rsrp, avg_sinr=avg_sinr,
         ))
     return squares, freq, {"origin_lng": origin_lng, "origin_lat": origin_lat,
                            "cell_lng": cell_lng, "cell_lat": cell_lat, "freq": freq}

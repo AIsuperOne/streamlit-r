@@ -40,6 +40,8 @@ class GridSquare:
     ne_lng: float        # 东北角经度
     ne_lat: float
     bearing: Optional[float] = None  # 从小区到栅格中心的方位角
+    avg_rsrp: Optional[float] = None  # 栅格内平均RSRP
+    avg_sinr: Optional[float] = None  # 栅格内平均SINR
 
 
 # ============================================================

@@ -218,6 +218,39 @@ def query_measurements(gnbid, ci, metric, indoor):
         avg_val = round(diff_sum / total_with_co, 1) if total_with_co > 0 else None
         return {"points": points, "count": total_with_co, "avg": avg_val, "grades": grade_counts}
 
+    if metric == "signal":
+        where = 'gnbid=? AND ci=? AND lng IS NOT NULL AND rsrp IS NOT NULL AND sinr IS NOT NULL'
+        q_params = [gnbid, ci]
+        if indoor == "1":
+            where += ' AND in_out_door="In_Door"'
+        elif indoor == "2":
+            where += ' AND in_out_door="Out_Door"'
+        conn = sqlite3.connect(DB_PATH)
+        try:
+            stat_row = conn.execute(
+                f'SELECT COUNT(*), '
+                f'AVG(rsrp), SUM(CASE WHEN rsrp>=-95 THEN 1 ELSE 0 END), SUM(CASE WHEN rsrp>=-105 AND rsrp<-95 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN rsrp>=-115 AND rsrp<-105 THEN 1 ELSE 0 END), SUM(CASE WHEN rsrp<-115 THEN 1 ELSE 0 END), '
+                f'AVG(sinr), SUM(CASE WHEN sinr>=15 THEN 1 ELSE 0 END), SUM(CASE WHEN sinr>=5 AND sinr<15 THEN 1 ELSE 0 END), '
+                f'SUM(CASE WHEN sinr>=-3 AND sinr<5 THEN 1 ELSE 0 END), SUM(CASE WHEN sinr<-3 THEN 1 ELSE 0 END) '
+                f'FROM "data" WHERE {where}', q_params,
+            ).fetchone()
+            total_count = stat_row[0] or 0
+            rsrp_avg = round(stat_row[1], 2) if stat_row[1] is not None else None
+            rsrp_grades = [stat_row[2], stat_row[3], stat_row[4], stat_row[5]]
+            sinr_avg = round(stat_row[6], 2) if stat_row[6] is not None else None
+            sinr_grades = [stat_row[7], stat_row[8], stat_row[9], stat_row[10]]
+            rows = conn.execute(
+                f'SELECT lng, lat, rsrp, sinr FROM "data" WHERE {where} LIMIT 5000',
+                q_params,
+            ).fetchall()
+        finally:
+            conn.close()
+        points = [[r[0], r[1], r[2], r[3]] for r in rows]
+        return {"points": points, "count": total_count,
+                "rsrp_avg": rsrp_avg, "sinr_avg": sinr_avg,
+                "rsrp_grades": rsrp_grades, "sinr_grades": sinr_grades}
+
     val_col = "rsrp" if metric == "rsrp" else "sinr"
     where = f'gnbid=? AND ci=? AND lng IS NOT NULL AND {val_col} IS NOT NULL'
     q_params = [gnbid, ci]
@@ -411,6 +444,10 @@ def query_grid_coverage_squares(gnbid, ci, indoor):
         if dominant_idx < 0:
             continue
         dominant_pct = round(top_count / grid_total * 100) if grid_total > 0 else 0
+        # 选中小区占比
+        selected_key = (gnbid, ci)
+        selected_count = cell_counts.get(selected_key, {}).get("count", 0)
+        pct = round(selected_count / grid_total * 100) if grid_total > 0 else 0
         sw_lng = origin_lng + gx * cell_lng
         sw_lat = origin_lat + gy * cell_lat
         ne_lng = origin_lng + (gx + 1) * cell_lng
@@ -422,6 +459,7 @@ def query_grid_coverage_squares(gnbid, ci, indoor):
             "dominant_pct": dominant_pct,
             "dominant_gnbid": top_cell[0],
             "dominant_ci": top_cell[1],
+            "pct": pct,
         })
 
     return {"cells": cell_list, "squares": result_squares}
@@ -568,8 +606,8 @@ def evaluate_cell(gnbid, ci, indoor):
     输入：gnbid, ci, indoor(0/1/2)
     输出：评估结果dict（扁平适配JS前端）
     """
-    from agent.analysis import analyze_cell
-    a = analyze_cell(gnbid, ci, indoor)
+    from agent.skills.cell_eval import get_cell_analysis
+    result = get_cell_analysis(gnbid, ci, indoor)
 
     # 调用数据分析智能体
     try:
@@ -579,49 +617,15 @@ def evaluate_cell(gnbid, ci, indoor):
         ai_analysis = f"AI分析失败：{e}"
 
     return {
-        "cell_name": a.cell_name,
-        "traffic_ratio": a.traffic_ratio,
-        "traffic_pass": a.traffic_pass,
-        "freq_avg_samples": a.freq_avg_samples,
-        "cell_samples": a.sample_count,
-        "area_ratio": a.area_ratio,
-        "area_pass": a.area_pass,
-        "cell_grid_area": a.grid_area_sqm,
-        "freq_avg_area": a.freq_avg_grids * 25,
-        "beam_inner_ratio": a.beam_inner_ratio,
-        "scatter_optimal_azimuth": a.scatter_optimal_azimuth,
-        "scatter_optimal_ratio": a.scatter_optimal_ratio,
-        "beam_pass": a.beam_pass,
-        "grid_weighted_optimal_azimuth": a.grid_weighted_optimal_azimuth,
-        "beam_grid_ratio": a.beam_grid_ratio or 0,
-        "optimal_beam_coverage_rate": a.optimal_beam_coverage_rate or 0,
-        "overlap_pass": a.overlap_pass,
-        "beam_coverage_current": a.beam_coverage_current or 0,
-        "beam_coverage_optimal": a.beam_coverage_optimal or 0,
-        "serving_pass": a.serving_pass,
-        "coverage_rate": a.coverage_rate or 0,
-        "excellence_rate": a.excellence_rate,
-        "coverage_pass": a.coverage_pass,
-        "excellence_pass": a.excellence_pass,
-        "interference_ratio": a.interference_ratio or 0,
-        "avg_neighbor_diff": a.avg_neighbor_diff,
-        "interference_pass": a.interference_pass,
-        "weak_coverage_ratio": a.weak_coverage_ratio,
-        "very_weak_ratio": a.very_weak_ratio,
-        "weak_coverage_pass": a.weak_coverage_pass,
-        "weak_azimuth_dist": a.weak_azimuth_dist,
-        "overshoot_ratio": a.overshoot_ratio,
-        "backfire_ratio": a.backfire_ratio,
-        "precision_pass": a.precision_pass,
-        "max_distance": a.max_distance,
-        "distance_distribution": a.distance_distribution,
-        "azimuth_deviation": a.azimuth_deviation,
-        "interf_azimuth_dist": a.interf_azimuth_dist,
-        "overall_pass": a.overall_pass,
-        "scale_score": a.scale_score,
-        "quality_score": a.quality_score,
-        "rf_score": a.rf_score,
-        "total_score": a.total_score,
+        "cell_name": result["cell_name"],
+        "overall_pass": result["overall_pass"],
+        "scale_score": result["scale_score"],
+        "quality_score": result["quality_score"],
+        "rf_score": result["rf_score"],
+        "total_score": result["total_score"],
+        "problems": result["problems"],
+        "current_azimuth": result["current_azimuth"],
+        "freq": result["freq"],
         "ai_analysis": ai_analysis,
     }
 
@@ -701,6 +705,7 @@ class MeasureAPI(BaseHTTPRequestHandler):
                 "gx": sq.gx, "gy": sq.gy,
                 "count": sq.count, "plmn_count": sq.plmn_count, "pct": sq.pct,
                 "weak_count": sq.weak_count, "weak_pct": sq.weak_pct,
+                "avg_rsrp": sq.avg_rsrp, "avg_sinr": sq.avg_sinr,
             })
 
         self._send_json({
@@ -848,28 +853,15 @@ def build_map_html(sectors_json):
   .eval-badge.pass {{ background: #2ECC71; color: #fff; }}
   .eval-badge.fail {{ background: #E74C3C; color: #fff; }}
   .score-badge {{ margin-left: 6px; padding: 1px 8px; border-radius: 3px; font-size: 13px; font-weight: bold; background: #1E90FF; color: #fff; }}
-  .eval-table {{ width: 100%; border-collapse: collapse; }}
-  .eval-table td {{ padding: 2px 6px; border-bottom: 1px solid #f0f0f0; }}
-  .eval-table tr.fail-row {{ background: #FFF5F5; }}
-  .eval-table .dim {{ color: #555; white-space: nowrap; font-size: 11px; min-width: 60px; }}
-  .eval-table .value {{ font-family: monospace; font-size: 11px; }}
-  .eval-table .threshold {{ color: #999; font-size: 10px; white-space: nowrap; }}
-  .eval-table .result {{ font-weight: bold; text-align: center; width: 22px; }}
-  .eval-table .result.pass {{ color: #2ECC71; }}
-  .eval-table .result.fail {{ color: #E74C3C; }}
-  .eval-layer {{
-    padding: 1px 6px; font-size: 10px; font-weight: bold; color: #fff;
-    background: #95a5a6;
-  }}
-  .eval-layer.scale {{ background: #3498db; }}
-  .eval-layer.structure {{ background: #e67e22; }}
-  .eval-layer.quality {{ background: #27ae60; }}
-  .eval-footer {{
-    padding: 4px 10px; background: #fafafa; border-top: 1px solid #eee;
-  }}
-  .eval-footer .label {{ font-weight: bold; color: #555; margin-right: 4px; }}
-  .eval-footer .weakness {{ color: #c0392b; margin-bottom: 2px; }}
-  .eval-footer .suggestion {{ color: #2980b9; }}
+  .eval-score-detail {{ font-size: 11px; color: #666; padding: 2px 8px; }}
+  .eval-section-title {{ font-weight: bold; font-size: 12px; color: #555; border-bottom: 1px solid #eee; padding-bottom: 2px; margin: 6px 0 4px; }}
+  .eval-problems, .eval-solutions {{ padding: 0 8px; }}
+  .problem-item {{ font-size: 11px; padding: 2px 0; color: #c0392b; }}
+  .problem-item.pass {{ color: #27ae60; }}
+  .solution-item {{ font-size: 11px; padding: 2px 0; color: #2980b9; }}
+  .dim-problems {{ margin-top: 6px; padding-top: 4px; border-top: 1px dashed #ddd; }}
+  .dim-problems-title {{ font-size: 11px; font-weight: bold; color: #c0392b; margin-bottom: 2px; }}
+  .dim-problem-item {{ font-size: 11px; color: #c0392b; padding: 1px 0; }}
   .eval-ai {{
     margin-top: 4px; padding: 6px 10px; background: #f8f9fa;
     border-top: 1px solid #eee; font-size: 11px; color: #444;
@@ -929,27 +921,20 @@ def build_map_html(sectors_json):
   <div id="eval-result"></div>
 
   <div id="measure-section">
-    <h4>测量数据</h4>
-    <div class="metric-toggle" style="margin-bottom:4px;">
+    <h4>诊断维度</h4>
+    <div class="metric-toggle">
+      <button class="active" id="btn-dim-coverage">覆盖</button>
+      <button id="btn-dim-signal">信号</button>
+      <button id="btn-dim-precision">精准</button>
+      <button id="btn-dim-competition">竞争</button>
+    </div>
+    <div class="metric-toggle" style="margin-top:4px;">
       <button class="active" id="btn-scatter">散点</button>
       <button id="btn-grid">栅格</button>
     </div>
-    <div id="scatter-controls">
-    <div class="metric-toggle">
-      <button class="active" id="btn-coverage">覆盖率</button>
-      <button id="btn-rsrp">RSRP</button>
+    <div id="signal-sub" style="display:none;margin-top:4px;" class="metric-toggle">
+      <button class="active" id="btn-rsrp">RSRP</button>
       <button id="btn-sinr">SINR</button>
-      <button id="btn-beam">波束</button>
-      <button id="btn-interf">主邻差</button>
-    </div>
-    </div>
-    <div id="grid-controls" style="display:none;">
-    <div class="metric-toggle">
-      <button class="active" id="btn-cell-pct">小区占比</button>
-      <button id="btn-weak-pct">覆盖比例</button>
-      <button id="btn-beam-pct">波束覆盖</button>
-      <button id="btn-cell-coverage">小区覆盖</button>
-    </div>
     </div>
     <select id="indoor-select">
       <option value="0">全部</option>
@@ -982,9 +967,12 @@ def build_map_html(sectors_json):
   var map, sectors = {sectors_json};
   var overlays = {{}}, dataMap = {{}};
   var selected = [];
-  var currentMetric = "coverage";
+  var evalData = null;
+  var currentDim = "coverage";
   var viewMode = "scatter";
-  var gridMode = "cell";
+  var signalMetric = "rsrp";
+  var currentMetric = "coverage";
+  var gridMode = "weak";
   var scatterByCell = {{}};
   var gridByCell = {{}};
   var gnbidCiToName = {{}};
@@ -1006,6 +994,27 @@ def build_map_html(sectors_json):
       if (FREQ_BANDS[band].indexOf(freq) >= 0) return band;
     }}
     return null;
+  }}
+
+  function syncModes() {{
+    currentMetric = getScatterMetric();
+    gridMode = getGridMode();
+    var sigSub = document.getElementById("signal-sub");
+    if (sigSub) sigSub.style.display = currentDim === "signal" ? "flex" : "none";
+  }}
+
+  function getScatterMetric() {{
+    if (currentDim === "coverage") return "coverage";
+    if (currentDim === "signal") return "signal";
+    if (currentDim === "precision") return "beam";
+    if (currentDim === "competition") return "interference";
+  }}
+
+  function getGridMode() {{
+    if (currentDim === "coverage") return "weak";
+    if (currentDim === "signal") return signalMetric;
+    if (currentDim === "precision") return "beam";
+    if (currentDim === "competition") return "coverage";
   }}
 
   function toggleBand(band) {{
@@ -1067,6 +1076,23 @@ def build_map_html(sectors_json):
     var sq = gp.sq;
     var gridParams = gp.gridParams;
     var indoor = document.getElementById("indoor-select").value;
+
+    // 信号维度直接显示栅格统计，无需请求详情API
+    if (gridMode === "rsrp" || gridMode === "sinr") {{
+      var html = '<div style="font-size:13px;line-height:1.6;min-width:200px;">';
+      html += '<div style="font-weight:bold;margin-bottom:4px;">栅格信号详情</div>';
+      html += '<div>栅格小区采样点: ' + sq.count + '</div>';
+      html += '<div>栅格总采样点数: ' + sq.plmn_count + '</div>';
+      if (sq.avg_rsrp != null) html += '<div>平均RSRP: ' + sq.avg_rsrp + ' dBm</div>';
+      if (sq.avg_sinr != null) html += '<div>平均SINR: ' + sq.avg_sinr + ' dB</div>';
+      html += '<div>覆盖率: ' + sq.pct + '%</div>';
+      html += '</div>';
+      if (activeInfoWindow) activeInfoWindow.close();
+      activeInfoWindow = new AMap.InfoWindow({{content: html, offset: new AMap.Pixel(0, -10)}});
+      activeInfoWindow.open(map, gp.getCenter());
+      return;
+    }}
+
     fetch("http://localhost:{API_PORT}/api/grid_cell_detail?origin_lng=" + gridParams.origin_lng + "&origin_lat=" + gridParams.origin_lat + "&cell_lng=" + gridParams.cell_lng + "&cell_lat=" + gridParams.cell_lat + "&gx=" + sq.gx + "&gy=" + sq.gy + "&freq=" + (gridParams.freq || "") + "&indoor=" + indoor)
       .then(function(r) {{ return r.json(); }})
       .then(function(details) {{
@@ -1122,6 +1148,9 @@ def build_map_html(sectors_json):
     html += '<div style="font-weight:bold;margin-bottom:4px;">栅格覆盖详情</div>';
     html += '<div>主服务小区: ' + dominantName + '</div>';
     html += '<div>主服占比: ' + (sq.dominant_pct || 0) + '%</div>';
+    if (sq.pct != null) {{
+      html += '<div>选中小区占比: ' + sq.pct + '%</div>';
+    }}
     html += '</div>';
     if (activeInfoWindow) activeInfoWindow.close();
     activeInfoWindow = new AMap.InfoWindow({{content: html, offset: new AMap.Pixel(0, -10)}});
@@ -1227,6 +1256,10 @@ def build_map_html(sectors_json):
       color = circularDiff(b, s.azimuth) <= 60 ? "#2ECC71" : "#E74C3C";
     }} else if (gridMode === "weak") {{
       color = weakColor(sq.weak_pct);
+    }} else if (gridMode === "rsrp") {{
+      color = rsrpColor(sq.avg_rsrp);
+    }} else if (gridMode === "sinr") {{
+      color = sinrColor(sq.avg_sinr);
     }} else if (gridMode === "coverage") {{
       var cs = dataMap[cellName];
       if (cs && cs.gnbid === sq.dominant_gnbid && cs.ci === sq.dominant_ci) {{
@@ -1307,6 +1340,10 @@ def build_map_html(sectors_json):
           }} else {{
             color = CELL_COLORS[gp.sq.dominant_idx % CELL_COLORS.length];
           }}
+        }} else if (gridMode === "rsrp") {{
+          color = rsrpColor(gp.sq.avg_rsrp);
+        }} else if (gridMode === "sinr") {{
+          color = sinrColor(gp.sq.avg_sinr);
         }} else {{
           var pct = gridMode === "weak" ? gp.sq.weak_pct : gp.sq.pct;
           var colorFn = gridMode === "weak" ? weakColor : pctColor;
@@ -1315,6 +1352,21 @@ def build_map_html(sectors_json):
         gp.polygon.setOptions({{ fillColor: color, strokeColor: color }});
         if (gp.line) gp.line.setOptions({{ strokeColor: color }});
       }});
+    }});
+  }}
+
+  function updateScatterColors() {{
+    Object.keys(scatterByCell).forEach(function(name) {{
+      var info = scatterByCell[name];
+      if (!info || !info.signalCached || !info.markers) return;
+      var colorFn = signalMetric === "rsrp" ? rsrpColor : sinrColor;
+      info.markers.forEach(function(m) {{
+        var val = signalMetric === "rsrp" ? m._rsrp : m._sinr;
+        var color = colorFn(val);
+        m.setOptions({{ fillColor: color, strokeColor: color }});
+      }});
+      info.avg = signalMetric === "rsrp" ? info.rsrp_avg : info.sinr_avg;
+      info.grades = signalMetric === "rsrp" ? info.rsrp_grades : info.sinr_grades;
     }});
   }}
 
@@ -1457,6 +1509,7 @@ def build_map_html(sectors_json):
         var points = result.points;
         var markers = [];
         var beamIn = 0, beamOut = 0;
+        var isSignal = metric === "signal";
         points.forEach(function(p) {{
           try {{
             var color;
@@ -1468,6 +1521,8 @@ def build_map_html(sectors_json):
               color = coverageColor(p[2]);
             }} else if (metric === "interference") {{
               color = interfColor(p[2]);
+            }} else if (isSignal) {{
+              color = signalMetric === "rsrp" ? rsrpColor(p[2]) : sinrColor(p[3]);
             }} else {{
               var colorFn = metric === "rsrp" ? rsrpColor : sinrColor;
               color = colorFn(p[2]);
@@ -1484,13 +1539,17 @@ def build_map_html(sectors_json):
             marker._cellName = name;
             marker._lng = p[0];
             marker._lat = p[1];
+            if (isSignal) {{
+              marker._rsrp = p[2];
+              marker._sinr = p[3];
+            }}
             marker.on("mouseover", function() {{ startShowTimer("scatter", marker); }});
             marker.on("mouseout", function() {{ startHideTimer(); }});
             marker.setMap(map);
             markers.push(marker);
           }} catch(e) {{}}
         }});
-        scatterByCell[name] = {{
+        var cellInfo = {{
           markers: markers,
           count: result.count,
           avg: result.avg,
@@ -1499,8 +1558,18 @@ def build_map_html(sectors_json):
           beamIn: metric === "beam" ? beamIn : 0,
           beamOut: metric === "beam" ? beamOut : 0,
           optimalAzimuth: null,
-          optimalRatio: null
+          optimalRatio: null,
+          signalCached: isSignal
         }};
+        if (isSignal) {{
+          cellInfo.avg = result.rsrp_avg;
+          cellInfo.grades = result.rsrp_grades;
+          cellInfo.rsrp_avg = result.rsrp_avg;
+          cellInfo.sinr_avg = result.sinr_avg;
+          cellInfo.rsrp_grades = result.rsrp_grades;
+          cellInfo.sinr_grades = result.sinr_grades;
+        }}
+        scatterByCell[name] = cellInfo;
         if (metric === "beam") {{
           fetch("http://localhost:{API_PORT}/api/optimal_azimuth?gnbid=" + encodeURIComponent(s.gnbid) + "&ci=" + encodeURIComponent(s.ci) + "&indoor=" + indoor)
             .then(function(r) {{ return r.json(); }})
@@ -1679,8 +1748,28 @@ def build_map_html(sectors_json):
       renderScatterStats(statsEl, legendEl);
     }} else if (gridMode === "coverage") {{
       renderCoverageStats(statsEl, legendEl);
+    }} else if (gridMode === "rsrp" || gridMode === "sinr") {{
+      renderSignalGridStats(statsEl, legendEl);
     }} else {{
       renderGridStats(statsEl, legendEl);
+    }}
+
+    // 诊断-Agent联动：显示当前维度相关评估问题
+    if (evalData && evalData.problems && evalData.problems.length > 0) {{
+      var dimMap = {{"coverage": "覆盖", "signal": "信号", "precision": "精准", "competition": "竞争"}};
+      var currentDimCn = dimMap[currentDim];
+      var dimProblems = evalData.problems.filter(function(p) {{ return p.dim === currentDimCn; }});
+      if (dimProblems.length > 0) {{
+        var html = '<div class="dim-problems">';
+        html += '<div class="dim-problems-title">' + currentDimCn + '维度问题</div>';
+        dimProblems.forEach(function(p) {{
+          var text = '❌ ' + p.metric;
+          if (p.detail) text += '（' + p.detail + '）';
+          html += '<div class="dim-problem-item">' + text + '</div>';
+        }});
+        html += '</div>';
+        statsEl.innerHTML += html;
+      }}
     }}
   }}
 
@@ -1789,9 +1878,10 @@ def build_map_html(sectors_json):
       return;
     }}
 
-    var metricLabel = currentMetric === "rsrp" ? "RSRP" : "SINR";
-    var metricUnit = currentMetric === "rsrp" ? "dBm" : "dB";
-    var grades = GRADES[currentMetric];
+    var activeMetric = currentMetric === "signal" ? signalMetric : currentMetric;
+    var metricLabel = activeMetric === "rsrp" ? "RSRP" : "SINR";
+    var metricUnit = activeMetric === "rsrp" ? "dBm" : "dB";
+    var grades = GRADES[activeMetric];
 
     var totalCount = 0;
     var weightedSum = 0;
@@ -1823,6 +1913,65 @@ def build_map_html(sectors_json):
         '<span class="legend-dot" style="background:' + g.color + '"></span>' +
         '<span class="legend-label">' + g.label + '(' + g.range + ')</span>' +
         '<span class="legend-count">' + cnt + '</span>' +
+        '<span class="legend-pct">' + pct + '%</span>' +
+      '</div>';
+    }}
+    legendEl.innerHTML = legendHtml;
+  }}
+
+  function renderSignalGridStats(statsEl, legendEl) {{
+    var names = Object.keys(gridByCell);
+    if (names.length === 0) return;
+    var isRsrp = gridMode === "rsrp";
+    var grades = isRsrp ? GRADES.rsrp : GRADES.sinr;
+    var metricLabel = isRsrp ? "RSRP" : "SINR";
+    var metricUnit = isRsrp ? "dBm" : "dB";
+    var valKey = isRsrp ? "avg_rsrp" : "avg_sinr";
+
+    var totalGridCount = 0;
+    var gradeSquareCounts = [0, 0, 0, 0];
+    var weightedSum = 0;
+    var weightedCount = 0;
+
+    names.forEach(function(name) {{
+      var info = gridByCell[name];
+      if (!info || info.loading) return;
+      totalGridCount += info.grid_count;
+      if (info.squares) {{
+        info.squares.forEach(function(sq) {{
+          var v = sq[valKey];
+          if (v == null) return;
+          weightedSum += v;
+          weightedCount++;
+          if (isRsrp) {{
+            if (v >= -95) gradeSquareCounts[0]++;
+            else if (v >= -105) gradeSquareCounts[1]++;
+            else if (v >= -115) gradeSquareCounts[2]++;
+            else gradeSquareCounts[3]++;
+          }} else {{
+            if (v >= 15) gradeSquareCounts[0]++;
+            else if (v >= 5) gradeSquareCounts[1]++;
+            else if (v >= -3) gradeSquareCounts[2]++;
+            else gradeSquareCounts[3]++;
+          }}
+        }});
+      }}
+    }});
+
+    var overallAvg = weightedCount > 0 ? (weightedSum / weightedCount).toFixed(2) : "--";
+    var html = '<div class="stat-row"><span>栅格数</span><span class="stat-val">' + totalGridCount + '</span></div>';
+    html += '<div class="stat-row"><span>' + metricLabel + ' 均值</span><span class="stat-val">' + overallAvg + ' ' + metricUnit + '</span></div>';
+    statsEl.innerHTML = html;
+
+    var legendHtml = "";
+    for (var i = 0; i < grades.length; i++) {{
+      var g = grades[i];
+      var cnt = gradeSquareCounts[i];
+      var pct = weightedCount > 0 ? (cnt / weightedCount * 100).toFixed(1) : "0.0";
+      legendHtml += '<div class="legend-item">' +
+        '<span class="legend-dot" style="background:' + g.color + '"></span>' +
+        '<span class="legend-label">' + g.label + '(' + g.range + ')</span>' +
+        '<span class="legend-count">' + cnt + '格</span>' +
         '<span class="legend-pct">' + pct + '%</span>' +
       '</div>';
     }}
@@ -2172,13 +2321,51 @@ def build_map_html(sectors_json):
   }}
 
   function setupMeasure() {{
+    syncModes();  // 初始化派生变量
+    var dimBtnIds = ['btn-dim-coverage', 'btn-dim-signal', 'btn-dim-precision', 'btn-dim-competition'];
+
+    function switchDimension(dim) {{
+      if (currentDim === dim) return;
+      var prevDim = currentDim;
+      currentDim = dim;
+      dimBtnIds.forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
+      document.getElementById('btn-dim-' + dim).classList.add('active');
+      syncModes();
+      // 如果从竞争维度切出，恢复扇区颜色
+      if (prevDim === "competition" && gridMode !== "coverage") {{
+        restoreSectorColors(); coverageCells = null; coverageOtherIndex = -1;
+      }}
+      // 按当前viewMode重新加载
+      if (viewMode === "scatter") {{
+        reloadAllScatter();
+      }} else {{
+        // 竞争维度需要重新加载栅格（不同API），其他维度仅更新颜色
+        if (dim === "competition" || prevDim === "competition") {{
+          // 清除旧栅格重新加载
+          Object.keys(gridByCell).forEach(function(name) {{
+            if (gridByCell[name].gridPolygons) {{
+              gridByCell[name].gridPolygons.forEach(function(gp) {{ gp.setMap(null); }});
+            }}
+            delete gridByCell[name];
+          }});
+          selected.forEach(function(name) {{ loadGrid(name); }});
+        }} else {{
+          updateGridColors();
+        }}
+        renderStats();
+      }}
+    }}
+
+    document.getElementById("btn-dim-coverage").onclick = function() {{ switchDimension("coverage"); }};
+    document.getElementById("btn-dim-signal").onclick = function() {{ switchDimension("signal"); }};
+    document.getElementById("btn-dim-precision").onclick = function() {{ switchDimension("precision"); }};
+    document.getElementById("btn-dim-competition").onclick = function() {{ switchDimension("competition"); }};
+
     document.getElementById("btn-scatter").onclick = function() {{
       if (viewMode === "scatter") return;
       viewMode = "scatter";
       document.getElementById("btn-scatter").classList.add("active");
       document.getElementById("btn-grid").classList.remove("active");
-      document.getElementById("scatter-controls").style.display = "block";
-      document.getElementById("grid-controls").style.display = "none";
       restoreSectorColors();
       coverageCells = null; coverageOtherIndex = -1;
       selected.forEach(function(name) {{
@@ -2192,128 +2379,76 @@ def build_map_html(sectors_json):
     document.getElementById("btn-grid").onclick = function() {{
       if (viewMode === "grid") return;
       viewMode = "grid";
-      gridMode = "cell";
+      syncModes();
       document.getElementById("btn-grid").classList.add("active");
       document.getElementById("btn-scatter").classList.remove("active");
-      document.getElementById("scatter-controls").style.display = "none";
-      document.getElementById("grid-controls").style.display = "block";
-      document.getElementById("btn-cell-pct").classList.add("active");
-      document.getElementById("btn-weak-pct").classList.remove("active");
-      document.getElementById("btn-beam-pct").classList.remove("active");
-      document.getElementById("btn-cell-coverage").classList.remove("active");
-      selected.forEach(function(name) {{
-        if (!gridByCell[name] || gridByCell[name].loading) {{
-          loadGrid(name);
-        }}
-      }});
+      // 竞争维度需要特殊栅格数据
+      if (currentDim === "competition") {{
+        Object.keys(gridByCell).forEach(function(name) {{
+          if (gridByCell[name].gridPolygons) {{
+            gridByCell[name].gridPolygons.forEach(function(gp) {{ gp.setMap(null); }});
+          }}
+          delete gridByCell[name];
+        }});
+        selected.forEach(function(name) {{ loadGrid(name); }});
+      }} else {{
+        selected.forEach(function(name) {{
+          if (!gridByCell[name] || gridByCell[name].loading) {{
+            loadGrid(name);
+          }}
+        }});
+      }}
       showGrid();
       renderStats();
     }};
+
     document.getElementById("btn-rsrp").onclick = function() {{
-      if (currentMetric === "rsrp") return;
-      currentMetric = "rsrp";
-      ['btn-coverage','btn-rsrp','btn-sinr','btn-beam','btn-interf'].forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
+      if (signalMetric === "rsrp") return;
+      signalMetric = "rsrp";
       document.getElementById("btn-rsrp").classList.add("active");
-      reloadAllScatter();
+      document.getElementById("btn-sinr").classList.remove("active");
+      syncModes();
+      if (viewMode === "scatter") {{
+        var allCached = selected.every(function(n) {{ return scatterByCell[n] && scatterByCell[n].signalCached; }});
+        if (allCached) {{
+          updateScatterColors();
+          renderStats();
+        }} else {{
+          reloadAllScatter();
+        }}
+      }} else {{
+        updateGridColors();
+        renderStats();
+      }}
     }};
     document.getElementById("btn-sinr").onclick = function() {{
-      if (currentMetric === "sinr") return;
-      currentMetric = "sinr";
-      ['btn-coverage','btn-rsrp','btn-sinr','btn-beam','btn-interf'].forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
+      if (signalMetric === "sinr") return;
+      signalMetric = "sinr";
       document.getElementById("btn-sinr").classList.add("active");
-      reloadAllScatter();
+      document.getElementById("btn-rsrp").classList.remove("active");
+      syncModes();
+      if (viewMode === "scatter") {{
+        var allCached = selected.every(function(n) {{ return scatterByCell[n] && scatterByCell[n].signalCached; }});
+        if (allCached) {{
+          updateScatterColors();
+          renderStats();
+        }} else {{
+          reloadAllScatter();
+        }}
+      }} else {{
+        updateGridColors();
+        renderStats();
+      }}
     }};
-    document.getElementById("btn-beam").onclick = function() {{
-      if (currentMetric === "beam") return;
-      currentMetric = "beam";
-      ['btn-coverage','btn-rsrp','btn-sinr','btn-beam','btn-interf'].forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-beam").classList.add("active");
-      reloadAllScatter();
-    }};
-    document.getElementById("btn-coverage").onclick = function() {{
-      if (currentMetric === "coverage") return;
-      currentMetric = "coverage";
-      ['btn-coverage','btn-rsrp','btn-sinr','btn-beam','btn-interf'].forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-coverage").classList.add("active");
-      reloadAllScatter();
-    }};
-    document.getElementById("btn-interf").onclick = function() {{
-      if (currentMetric === "interference") return;
-      currentMetric = "interference";
-      ['btn-coverage','btn-rsrp','btn-sinr','btn-beam','btn-interf'].forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-interf").classList.add("active");
-      reloadAllScatter();
-    }};
+
     document.getElementById("indoor-select").onchange = function() {{
       if (selected.length > 0) {{
         if (viewMode === "scatter") {{
           reloadAllScatter();
-        }} else if (gridMode === "coverage") {{
-          reloadAllGrid();
         }} else {{
           reloadAllGrid();
         }}
       }}
-    }};
-    var gridBtnIds = ['btn-cell-pct', 'btn-weak-pct', 'btn-beam-pct', 'btn-cell-coverage'];
-    document.getElementById("btn-cell-pct").onclick = function() {{
-      if (gridMode === "cell") return;
-      var prevMode = gridMode;
-      gridMode = "cell";
-      gridBtnIds.forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-cell-pct").classList.add("active");
-      if (prevMode === "coverage") {{
-        restoreSectorColors(); coverageCells = null; coverageOtherIndex = -1;
-        reloadAllGrid();
-      }}
-      updateGridColors();
-      renderStats();
-    }};
-    document.getElementById("btn-weak-pct").onclick = function() {{
-      if (gridMode === "weak") return;
-      var prevMode = gridMode;
-      gridMode = "weak";
-      gridBtnIds.forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-weak-pct").classList.add("active");
-      if (prevMode === "coverage") {{
-        restoreSectorColors(); coverageCells = null; coverageOtherIndex = -1;
-        reloadAllGrid();
-      }}
-      updateGridColors();
-      renderStats();
-    }};
-    document.getElementById("btn-beam-pct").onclick = function() {{
-      if (gridMode === "beam") return;
-      var prevMode = gridMode;
-      gridMode = "beam";
-      gridBtnIds.forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-beam-pct").classList.add("active");
-      if (prevMode === "coverage") {{
-        restoreSectorColors(); coverageCells = null; coverageOtherIndex = -1;
-        reloadAllGrid();
-      }}
-      updateGridColors();
-      renderStats();
-    }};
-    document.getElementById("btn-cell-coverage").onclick = function() {{
-      if (gridMode === "coverage") return;
-      gridMode = "coverage";
-      gridBtnIds.forEach(function(id) {{ document.getElementById(id).classList.remove('active'); }});
-      document.getElementById("btn-cell-coverage").classList.add("active");
-      Object.keys(scatterByCell).forEach(function(name) {{
-        if (scatterByCell[name].markers) {{
-          scatterByCell[name].markers.forEach(function(m) {{ m.setMap(null); }});
-        }}
-      }});
-      // 清除旧栅格数据，重新加载覆盖模式
-      Object.keys(gridByCell).forEach(function(name) {{
-        if (gridByCell[name].gridPolygons) {{
-          gridByCell[name].gridPolygons.forEach(function(gp) {{ gp.setMap(null); }});
-        }}
-        delete gridByCell[name];
-      }});
-      selected.forEach(function(name) {{ loadGrid(name); }});
-      renderStats();
     }};
   }}
 
@@ -2329,88 +2464,56 @@ def build_map_html(sectors_json):
     results.forEach(function(r) {{
       var passClass = r.overall_pass ? "pass" : "fail";
       var passText = r.overall_pass ? "合格" : "不合格";
-      var failCount = [r.traffic_pass, r.area_pass, r.beam_pass, r.overlap_pass, r.coverage_pass, r.excellence_pass].filter(function(v){{return !v;}}).length;
+      var problems = r.problems || [];
+      var problemCount = problems.length;
 
       html += '<div class="eval-card">';
 
-      // Header
+      // Section 1: 评分
       html += '<div class="eval-header">';
       html += '<span class="cell-name">' + r.cell_name + '</span>';
-      html += '<span class="eval-badge ' + passClass + '">' + passText + (failCount > 0 ? '（' + failCount + '项不合格）' : '') + '</span>';
+      html += '<span class="eval-badge ' + passClass + '">' + passText + (problemCount > 0 ? '（' + problemCount + '项问题）' : '') + '</span>';
       html += '<span class="score-badge">' + r.total_score + '分</span>';
       html += '</div>';
+      html += '<div class="eval-score-detail">规模' + r.scale_score + '/50 · 质量' + r.quality_score + '/30 · 射频' + r.rf_score + '/20</div>';
 
-      // Table
-      html += '<table class="eval-table">';
-
-      // Scale layer
-      html += '<tr><td colspan="4" class="eval-layer scale">规模评估</td></tr>';
-      html += makeRow('业务水平', r.traffic_ratio, '≥1.0', r.traffic_pass);
-      html += makeRow('面积水平', r.area_ratio, '≥1.0', r.area_pass);
-
-      // Structure layer
-      html += '<tr><td colspan="4" class="eval-layer structure">结构评估</td></tr>';
-      var beamVal = (r.scatter_optimal_azimuth != null && r.beam_inner_ratio != null) ? r.scatter_optimal_azimuth + '°/' + r.beam_inner_ratio + '%/' + (r.scatter_optimal_ratio != null ? r.scatter_optimal_ratio : '--') + '%' : '未知';
-      html += makeRow('正对用户', beamVal, '≥60%', r.beam_pass);
-      var overlapVal = r.grid_weighted_optimal_azimuth + '°/' + r.beam_grid_ratio + '%/' + r.optimal_beam_coverage_rate + '%';
-      html += makeRow('正对栅格', overlapVal, '≥80%', r.overlap_pass);
-      var servingVal = r.grid_weighted_optimal_azimuth + '°/' + r.beam_coverage_current + '%/' + r.beam_coverage_optimal + '%';
-      html += makeRow('主服覆盖', servingVal, '≥80%', r.serving_pass);
-
-      // Quality layer
-      html += '<tr><td colspan="4" class="eval-layer quality">质量评估</td></tr>';
-      html += makeRow('散点覆盖率', r.coverage_rate + '%', '>95%', r.coverage_pass);
-      html += makeRow('栅格优良率', r.excellence_rate + '%', '>95%', r.excellence_pass);
-      html += '<tr><td colspan="4" class="eval-layer quality">射频专项</td></tr>';
-      // 覆盖不足
-      var weakDir = '--';
-      if (r.weak_azimuth_dist) {{
-        var maxIdx = 0, maxVal = 0;
-        for (var i = 0; i < r.weak_azimuth_dist.length; i++) {{
-          if (r.weak_azimuth_dist[i] > maxVal) {{ maxVal = r.weak_azimuth_dist[i]; maxIdx = i; }}
-        }}
-        weakDir = (maxIdx * 30 + 15) + '°';
+      // Section 2: 覆盖问题（按维度分组）
+      html += '<div class="eval-problems">';
+      html += '<div class="eval-section-title">覆盖问题</div>';
+      if (problemCount === 0) {{
+        html += '<div class="problem-item pass">✓ 全部合格</div>';
+      }} else {{
+        var dimOrder = ["信号", "精准", "竞争", "覆盖"];
+        var dimIcons = {{"信号": "📶", "精准": "🎯", "竞争": "⚔", "覆盖": "📡"}};
+        var dimGroups = {{}};
+        problems.forEach(function(p) {{
+          if (!dimGroups[p.dim]) dimGroups[p.dim] = [];
+          dimGroups[p.dim].push(p);
+        }});
+        dimOrder.forEach(function(dim) {{
+          var dimProbs = dimGroups[dim];
+          if (!dimProbs) return;
+          html += '<div style="font-size:11px;font-weight:bold;color:#555;margin-top:3px;">' + (dimIcons[dim] || '') + ' ' + dim + '维度</div>';
+          dimProbs.forEach(function(p) {{
+            var text = '❌ ' + p.category + '：' + p.metric + ' > ' + p.threshold + p.unit;
+            if (p.detail) text += '，' + p.detail;
+            html += '<div class="problem-item">' + text + '</div>';
+          }});
+        }});
       }}
-      html += '<tr><td>覆盖不足</td><td>弱覆盖' + r.weak_coverage_ratio + '% / 极弱' + r.very_weak_ratio + '% / 集中方向' + weakDir + '</td><td>≤5%</td><td>' + (r.weak_coverage_pass ? '✅' : '❌') + '</td></tr>';
-      // 越区覆盖
-      html += '<tr><td>越区覆盖</td><td>远距' + r.overshoot_ratio + '% / 最远' + r.max_distance + 'm</td><td>≤10%</td><td>' + (r.overshoot_ratio <= 10 ? '✅' : '❌') + '</td></tr>';
-      // 精准覆盖
-      var devStr = r.azimuth_deviation != null ? r.azimuth_deviation + '°' : '--';
-      html += '<tr><td>精准覆盖</td><td>波束内' + (r.beam_inner_ratio || '--') + '% / 偏差' + devStr + ' / 最优' + (r.scatter_optimal_azimuth != null ? r.scatter_optimal_azimuth + '°' : '--') + '</td><td>≤30°</td><td>' + (r.precision_pass ? '✅' : '❌') + '</td></tr>';
-      // 重叠覆盖
-      var interfDir = '--';
-      if (r.interf_azimuth_dist) {{
-        var iMaxIdx = 0, iMaxVal = 0;
-        for (var i = 0; i < r.interf_azimuth_dist.length; i++) {{
-          if (r.interf_azimuth_dist[i] > iMaxVal) {{ iMaxVal = r.interf_azimuth_dist[i]; iMaxIdx = i; }}
-        }}
-        interfDir = (iMaxIdx * 30 + 15) + '°';
-      }}
-      var interfStr = r.interference_ratio + '% / 主邻差' + (r.avg_neighbor_diff != null ? r.avg_neighbor_diff + 'dB' : '--') + ' / 集中' + interfDir;
-      html += '<tr><td>重叠覆盖</td><td>' + interfStr + '</td><td>≤10%</td><td>' + (r.interference_pass ? '✅' : '❌') + '</td></tr>';
-      // 背向覆盖
-      html += '<tr><td>背向覆盖</td><td>背向' + r.backfire_ratio + '%</td><td>≤10%</td><td>' + (r.backfire_ratio <= 10 ? '✅' : '❌') + '</td></tr>';
-      // 综合评估
-      var rfPass = (r.weak_coverage_pass !== false) && (r.overshoot_ratio <= 10) && (r.precision_pass !== false) && (r.interference_pass !== false) && (r.backfire_ratio <= 10);
-      var scalePass = r.traffic_pass && r.area_pass;
-      var summaryResult = '✅';
-      var summaryText = '综合合格';
-      if (!scalePass) {{ summaryResult = '❌'; summaryText = '增加小区覆盖和对准用户'; }}
-      else if (!rfPass) {{ summaryResult = '❌'; summaryText = '射频待优化，需调整'; }}
-      html += '<tr><td colspan="4" class="eval-layer quality">综合评估</td></tr>';
-      html += '<tr><td>综合评分</td><td>规模' + r.scale_score + '/50 质量' + r.quality_score + '/30 射频' + r.rf_score + '/20</td><td>100分</td><td>' + summaryResult + '</td></tr>';
-      html += '<tr><td>综合判定</td><td>' + summaryText + '</td><td>--</td><td>' + summaryResult + '</td></tr>';
+      html += '</div>';
 
-      html += '</table>';
-
-      // Footer with weakness and suggestion (extracted from ai_analysis)
-      if (r.ai_analysis && !r.overall_pass) {{
-        var weakness = extractSection(r.ai_analysis, '短板');
-        var suggestion = extractSection(r.ai_analysis, '建议');
-        if (weakness || suggestion) {{
-          html += '<div class="eval-footer">';
-          if (weakness) html += '<div class="weakness"><span class="label">短板：</span>' + weakness + '</div>';
-          if (suggestion) html += '<div class="suggestion"><span class="label">建议：</span>' + suggestion + '</div>';
+      // Section 3: 解决方案
+      if (problemCount > 0 && r.ai_analysis) {{
+        var solutions = extractSection(r.ai_analysis, '解决方案');
+        if (solutions) {{
+          html += '<div class="eval-solutions">';
+          html += '<div class="eval-section-title">解决方案</div>';
+          // Split by numbered lines
+          var lines = solutions.split('\\n').filter(function(l) {{ return l.trim().length > 0; }});
+          lines.forEach(function(line) {{
+            html += '<div class="solution-item">' + line.trim() + '</div>';
+          }});
           html += '</div>';
         }}
       }}
@@ -2425,33 +2528,16 @@ def build_map_html(sectors_json):
     el.innerHTML = html;
   }}
 
-  function makeRow(dim, value, threshold, pass) {{
-    var rc = pass ? 'pass' : 'fail';
-    var rt = pass ? '✓' : '✗';
-    var rowClass = pass ? '' : ' class="fail-row"';
-    return '<tr' + rowClass + '><td class="dim">' + dim + '</td><td class="value">' + value + '</td><td class="threshold">' + threshold + '</td><td class="result ' + rc + '">' + rt + '</td></tr>';
-  }}
-
   function extractSection(text, keyword) {{
-    var patterns = ['【' + keyword + '】', '[' + keyword + ']'];
-    for (var i = 0; i < patterns.length; i++) {{
-      var idx = text.indexOf(patterns[i]);
-      if (idx >= 0) {{
-        var start = idx + patterns[i].length;
-        var end = text.length;
-        for (var j = i + 1; j < patterns.length; j++) {{
-          var nextIdx = text.indexOf(patterns[j], start);
-          if (nextIdx >= 0 && nextIdx < end) end = nextIdx;
-        }}
-        // Also check for other section markers
-        var sectionEnd = text.indexOf('【', start);
-        if (sectionEnd >= 0 && sectionEnd < end) end = sectionEnd;
-        var sectionEnd2 = text.indexOf('\\n【', start);
-        if (sectionEnd2 >= 0 && sectionEnd2 < end) end = sectionEnd2;
-        return text.substring(start, end).trim();
-      }}
-    }}
-    return '';
+    var marker = '【' + keyword + '】';
+    var idx = text.indexOf(marker);
+    if (idx < 0) return '';
+    var start = idx + marker.length;
+    var end = text.length;
+    // Find next section marker
+    var nextSection = text.indexOf('【', start);
+    if (nextSection >= 0) end = nextSection;
+    return text.substring(start, end).trim();
   }}
 
   document.getElementById("eval-btn").onclick = function() {{
@@ -2490,13 +2576,20 @@ def build_map_html(sectors_json):
               if (pending === 0) {{
                 evalBtn.disabled = false;
                 renderEvalResults(results);
+                // 缓存评估数据供诊断联动使用
+                evalData = results.length === 1 ? results[0] : {{ problems: results.reduce(function(arr, r) {{ return arr.concat(r.problems || []); }}, []) }};
+                renderStats();
               }}
             }})
             .catch(function() {{
               pending--;
               if (pending === 0) {{
                 evalBtn.disabled = false;
-                if (results.length > 0) renderEvalResults(results);
+                if (results.length > 0) {{
+                  renderEvalResults(results);
+                  evalData = results.length === 1 ? results[0] : {{ problems: results.reduce(function(arr, r) {{ return arr.concat(r.problems || []); }}, []) }};
+                  renderStats();
+                }}
                 else resultEl.innerHTML = '<div style="color:#e00;font-size:12px;">AI评估失败</div>';
               }}
             }});

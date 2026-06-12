@@ -67,12 +67,13 @@ def build_grid_polygons(cell_pts, origin_lng, origin_lat, cell_lng, cell_lat):
         ne_lng = origin_lng + (gx + 1) * cell_lng
         ne_lat = origin_lat + (gy + 1) * cell_lat
         polygons.append({"gx": gx, "gy": gy, "cell_count": count, "plmn_count": 0, "weak_count": 0,
+                         "rsrp_sum": 0.0, "rsrp_count": 0, "sinr_sum": 0.0, "sinr_count": 0,
                          "bounds": (sw_lng, sw_lat, ne_lng, ne_lat)})
     return polygons
 
 
 def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng, cell_lat):
-    """数学落格映射PLMN归属：gx/gy键判定 → 统计plmn_count和weak_count"""
+    """数学落格映射PLMN归属：gx/gy键判定 → 统计plmn_count/weak_count/rsrp_sum/sinr_sum"""
     poly_map = { (p["gx"], p["gy"]): p for p in polygons }
     for r in plmn_rows:
         lng, lat = r[0], r[1]
@@ -82,6 +83,12 @@ def count_plmn_in_polygons(plmn_rows, polygons, origin_lng, origin_lat, cell_lng
         if key in poly_map:
             poly_map[key]["plmn_count"] += 1
             rsrp, sinr = r[2], r[3]
+            if rsrp is not None:
+                poly_map[key]["rsrp_sum"] += rsrp
+                poly_map[key]["rsrp_count"] += 1
+            if sinr is not None:
+                poly_map[key]["sinr_sum"] += sinr
+                poly_map[key]["sinr_count"] += 1
             if rsrp is not None and sinr is not None and (rsrp < -105 or sinr < -3):
                 poly_map[key]["weak_count"] += 1
 
